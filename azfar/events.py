@@ -9,7 +9,7 @@ Usage: python -m azfar.events --ids data/identities.npz --ball data/ball.npz --o
 from __future__ import annotations
 import argparse, json, os
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, median_filter
 from .timeline import GRID_HZ, fmt
 
 DT = 1.0 / GRID_HZ
@@ -48,7 +48,10 @@ def grid_ball(B, k0, k1):
             continue
         kk = np.arange(k[s], k[e - 1] + 1)
         ok = (kk >= k0) & (kk < k1)
-        b[kk[ok] - k0] = np.c_[np.interp(kk, k[s:e], xy[s:e, 0]), np.interp(kk, k[s:e], xy[s:e, 1])][ok]
+        x, y = np.interp(kk, k[s:e], xy[s:e, 0]), np.interp(kk, k[s:e], xy[s:e, 1])
+        if len(kk) >= 3:  # median of three: removes single-sample flicker without rounding off kicks
+            x, y = median_filter(x, 3, mode="nearest"), median_filter(y, 3, mode="nearest")
+        b[kk[ok] - k0] = np.c_[x, y][ok]
     return b
 
 
