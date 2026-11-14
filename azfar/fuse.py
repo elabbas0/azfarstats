@@ -11,7 +11,8 @@ from .timeline import scan, GRID_HZ
 from .features import DIM
 
 DT = 1.0 / GRID_HZ
-MARGIN = 1.5          # metres outside the lines still counted as "on the pitch"
+VIEW_MARGIN = 1.5     # per-view tolerance before fusion (far-range foot points are noisy)
+MARGIN = 0.5          # fused position must be within this of the lines: people off the pitch are not counted
 MIN_CONF = 0.30
 GATE = 2.2            # association gate (m) track <-> detection
 MERGE_GATE = 2.5      # cross-camera merge gate (m) at mid range
@@ -19,7 +20,19 @@ MAX_MISS = 6          # ticks a track may coast
 CROWD = 0.9           # two players closer than this (m) -> identities are ambiguous
 
 
-def load_camera_dets(det_dir, clips, cam, ch, pitch):
+def aim_cameras(calib, ch):
+    """[(t0, t1, Camera)] following the camera's aim through the recording (see azfar.drift)."""
+    base = calib["cameras"][ch]
+    wins = calib.get("aim", {}).get(ch, [])
+    if not wins:
+        return [(-1e18, 1e18, Camera.from_dict(base))]
+    out = [(w["t0"], w["t1"], Camera.from_dict({**base, "rvec": w["rvec"]})) for w in wins]
+    out[0] = (-1e18,) + out[0][1:]
+    out[-1] = (out[-1][0], 1e18, out[-1][2])
+    return out
+
+
+def load_camera_dets(det_dir, clips, cams, ch, pitch):
     """All person detections of one camera projected to the pitch. Returns dict of arrays."""
     ks, xy, hh, conf, feat, box, rng = [], [], [], [], [], [], []
     balls = []
@@ -29,26 +42,33 @@ def load_camera_dets(det_dir, clips, cam, ch, pitch):
         p = os.path.join(det_dir, os.path.basename(c.path).replace(".mp4", ".npz"))
         if not os.path.exists(p):
             continue
-        d = np.load(p)
-        b = d["box"]
-        isb = d["cls"] == 32
-        if isb.any():
-            bb = b[isb]
-            cen = np.c_[(bb[:, 0] + bb[:, 2]) / 2, (bb[:, 1] + bb[:, 3]) / 2]
-            g, ok = cam.to_ground(cen, height=0.11)
-            balls.append(np.c_[d["k"][isb], g, d["conf"][isb], ok])
-        m = (d["cls"] == 0) & (d["conf"] >= MIN_CONF)
-        b = b[m]
-        foot = np.c_[(b[:, 0] + b[:, 2]) / 2, b[:, 3]]
-        top = np.c_[(b[:, 0] + b[:, 2]) / 2, b[:, 1]]
-        g, ok = cam.to_ground(foot)
-        h = cam.height_at(top, g)
-        loc = cam._to_local(np.c_[g, np.zeros(len(g))])
-        r = np.linalg.norm(loc - cam.C, axis=1)
-        inside = ok & (g[:, 0] > -MARGIN) & (g[:, 0] < pitch["L"] + MARGIN) & (g[:, 1] > -MARGIN) & (g[:, 1] < pitch["W"] + MARGIN)
-        inside &= (h > 0.7) & (h < 2.5) & (b[:, 3] < 1075)  # plausible person, feet not cut by the frame
-        ks.append(d["k"][m][inside]); xy.append(g[inside]); hh.append(h[inside]); conf.append(d["conf"][m][inside])
-        feat.append(d["feat"][m][inside]); box.append(b[inside]); rng.append(r[inside])
+        dd = np.load(p)
+        tt = dd["k"] / GRID_HZ
+        for wi, (t0, t1, cam) in enumerate(cams):
+            nxt = cams[wi + 1][0] if wi + 1 < len(cams) else 1e18
+            sel = (tt >= t0) & (tt < nxt)
+            if not sel.any():
+                continue
+            d = {key: dd[key][sel] for key in ("k", "box", "conf", "cls", "feat")}
+            b = d["box"]
+            isb = d["cls"] == 32
+            if isb.any():
+                bb = b[isb]
+                cen = np.c_[(bb[:, 0] + bb[:, 2]) / 2, (bb[:, 1] + bb[:, 3]) / 2]
+                g, ok = cam.to_ground(cen, height=0.11)
+                balls.append(np.c_[d["k"][isb], g, d["conf"][isb], ok])
+            m = (d["cls"] == 0) & (d["conf"] >= MIN_CONF)
+            b = b[m]
+            foot = np.c_[(b[:, 0] + b[:, 2]) / 2, b[:, 3]]
+            top = np.c_[(b[:, 0] + b[:, 2]) / 2, b[:, 1]]
+            g, ok = cam.to_ground(foot)
+            h = cam.height_at(top, g)
+            loc = cam._to_local(np.c_[g, np.zeros(len(g))])
+            r = np.linalg.norm(loc - cam.C, axis=1)
+            inside = ok & (g[:, 0] > -VIEW_MARGIN) & (g[:, 0] < pitch["L"] + VIEW_MARGIN) & (g[:, 1] > -VIEW_MARGIN) & (g[:, 1] < pitch["W"] + VIEW_MARGIN)
+            inside &= (h > 0.7) & (h < 2.5) & (b[:, 3] < 1075)  # plausible person, feet not cut by the frame
+            ks.append(d["k"][m][inside]); xy.append(g[inside]); hh.append(h[inside]); conf.append(d["conf"][m][inside])
+            feat.append(d["feat"][m][inside]); box.append(b[inside]); rng.append(r[inside])
     cat = lambda L, shape=(0,): np.concatenate(L) if L else np.zeros(shape)
     out = dict(k=cat(ks).astype(np.int64), xy=cat(xy, (0, 2)), h=cat(hh), conf=cat(conf), feat=cat(feat, (0, DIM)),
                box=cat(box, (0, 4)), rng=cat(rng))
@@ -89,9 +109,8 @@ def run(det_dir, raw_dir, calib_path, offset_ticks=0):
     calib = json.load(open(calib_path))
     pitch = calib["pitch"]
     clips = scan(raw_dir)
-    cams = {ch: Camera.from_dict(c) for ch, c in calib["cameras"].items()}
-    chs = sorted(cams)
-    V = [load_camera_dets(det_dir, clips, cams[ch], ch, pitch) for ch in chs]
+    chs = sorted(calib["cameras"])
+    V = [load_camera_dets(det_dir, clips, aim_cameras(calib, ch), ch, pitch) for ch in chs]
     V[1]["k"] = V[1]["k"] + offset_ticks
     order = [np.argsort(v["k"], kind="stable") for v in V]
     for v, o in zip(V, order):
@@ -119,6 +138,7 @@ def run(det_dir, raw_dir, calib_path, offset_ticks=0):
                 fused.append((views[0]["xy"][i], views[0]["h"][i], sigma(views[0]["rng"][i]), views[0]["base"] + i, -1))
             else:
                 fused.append((views[1]["xy"][j], views[1]["h"][j], sigma(views[1]["rng"][j]), -1, views[1]["base"] + j))
+        fused = [f for f in fused if -MARGIN < f[0][0] < pitch["L"] + MARGIN and -MARGIN < f[0][1] < pitch["W"] + MARGIN]
         # --- associate to tracks
         P = np.array([f[0] for f in fused]).reshape(-1, 2)
         if tracks and len(P):

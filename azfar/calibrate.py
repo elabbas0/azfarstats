@@ -13,14 +13,16 @@ from .camera import Camera
 CAMS = ("ch2", "ch3")
 
 
-def snap(gray, poly, radius=7, step=6):
+def snap(gray, poly, radius=7, step=6, with_flags=False):
     """Sample a seed polyline and snap each sample to the brightest ridge across it."""
     th = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
     th = cv2.GaussianBlur(th, (0, 0), 1.2)
     poly = np.asarray(poly, float)
-    out = []
+    out, flags = [], []
     for a, b in zip(poly[:-1], poly[1:]):
-        n = max(2, int(np.linalg.norm(b - a) / step))
+        if np.linalg.norm(b - a) < 1e-6:
+            continue
+        n = max(1, int(np.linalg.norm(b - a) / step))
         t = (b - a) / np.linalg.norm(b - a)
         nrm = np.array([-t[1], t[0]])
         for s in np.linspace(0, 1, n, endpoint=False):
@@ -32,9 +34,11 @@ def snap(gray, poly, radius=7, step=6):
             v = th[yi, xi]
             k = int(v.argmax())
             if v[k] > 12 and 0 < k < len(offs) - 1:
-                out.append(q[k])
+                out.append(q[k]); flags.append(True)
             else:
-                out.append(p)  # keep the hand-placed point when no clear ridge
+                out.append(p); flags.append(False)  # keep the seed point when no clear ridge
+    if with_flags:
+        return np.array(out).reshape(-1, 2), np.array(flags, bool)
     return np.array(out)
 
 
