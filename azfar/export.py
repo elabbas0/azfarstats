@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--session", default="config/session.json")
     ap.add_argument("--out", default="data/out/replay.html")
     ap.add_argument("--no-thumbs", action="store_true")
+    ap.add_argument("--video", default="data/out/video", help="folder with split-view segments (see azfar.video)")
     a = ap.parse_args()
     I, T, B = np.load(a.ids), np.load(a.tracks), np.load(a.ball)
     stats, ev = json.load(open(a.stats)), json.load(open(a.events))
@@ -105,6 +106,11 @@ def main():
                               "passes, shots, goals and the other ball events are estimates from ball and player positions - click any event to check it in the replay."),
                 pitch=stats["pitch"], hz=GRID_HZ, n=k1 - k0, k0=k0, t0=k0 / GRID_HZ, windows=stats["windows"],
                 players=players, ball=segs(ball), events=[e for e in ev["events"] if e["type"] != "touch"])
+    seg_file = os.path.join(a.video, "segments.json")
+    if os.path.exists(seg_file):
+        have = [s for s in json.load(open(seg_file)) if os.path.exists(os.path.join(a.video, s["src"]))]
+        if have:
+            data["video"] = dict(base="video/", segments=have)
     tpl = open(os.path.join(os.path.dirname(__file__), "replay_template.html")).read()
     html = tpl.replace("/*DATA*/null/*END*/", json.dumps(data, separators=(",", ":")).replace("</", "<\\/"))
     os.makedirs(os.path.dirname(a.out), exist_ok=True)

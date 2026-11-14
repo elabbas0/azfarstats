@@ -24,6 +24,8 @@ header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; }
 h1 { font-family: var(--display); font-size: 1.6rem; margin: 0; letter-spacing: -0.01em; }
 .sub { color: var(--ink-2); font-size: 0.9rem; }
 .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+#vid { display: block; width: 100%; aspect-ratio: 32 / 9; background: #000; }
+.vidcap { display: flex; flex-wrap: wrap; gap: 6px 16px; justify-content: space-between; align-items: center; padding: 8px 14px; color: var(--ink-2); font-size: 0.85rem; border-bottom: 1px solid var(--line); }
 canvas#pitch { display: block; width: 100%; height: auto; background: var(--turf); touch-action: manipulation; }
 .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 10px 14px; }
 .bar button, .tabs button, .chip { font: inherit; color: var(--ink); background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
@@ -72,6 +74,10 @@ tbody tr.sel td { background: var(--hi); }
     <span class="sub" id="meta"></span>
   </header>
   <section class="stage" aria-label="Top-down replay">
+    <div id="vidwrap" hidden>
+      <video id="vid" playsinline muted preload="metadata" aria-label="Both cameras side by side: camera 2 left, camera 3 right"></video>
+      <div class="vidcap"><span>Camera 2 (left) and camera 3 (right), aligned on the computed timeline. Each picture carries its own burnt-in clock.</span><label class="tog"><input type="checkbox" id="showvid" checked> Show video</label></div>
+    </div>
     <canvas id="pitch" width="1200" height="640" role="img" aria-label="Pitch seen from above with player and ball positions"></canvas>
     <div class="bar">
       <button id="play" type="button">Play</button>
@@ -152,16 +158,41 @@ const DATA = /*DATA*/null/*END*/;
     clock.textContent = fmt(D.t0 + t / HZ);
     if (document.activeElement !== seek) seek.value = Math.floor(t);
   }
+  // --- video: when segments exist, the video is the master clock and the top-down view follows it
+  const vid = document.getElementById('vid'), segs = (D.video && D.video.segments) || [];
+  let cur = -1, useVid = segs.length > 0;
+  const wall = () => D.t0 + t / HZ;
+  const segAt = w => segs.findIndex(s => w >= s.start && w < s.start + s.dur);
+  function cue(andPlay) {            // point the video at the current playhead
+    if (!useVid) return false;
+    const w = wall(), i = segAt(w);
+    if (i < 0) { vid.pause(); return false; }
+    const go = () => { try { vid.currentTime = Math.max(0, w - segs[i].start); } catch (e) {} vid.playbackRate = speed; if (andPlay) vid.play().catch(() => {}); };
+    if (i !== cur) { cur = i; vid.src = D.video.base + segs[i].src; vid.addEventListener('loadedmetadata', go, { once: true }); vid.load(); } else go();
+    return true;
+  }
+  if (segs.length) {
+    document.getElementById('vidwrap').hidden = false;
+    vid.addEventListener('ended', () => { if (playing && cur + 1 < segs.length) { t = (segs[cur + 1].start - D.t0) * HZ + 0.01; cue(true); } else if (playing) setPlay(false); });
+    vid.addEventListener('error', () => { if (!vid.src) return; useVid = false; vid.hidden = true; document.querySelector('.vidcap span').textContent = 'This browser could not play the video segment; the top-down replay still works.'; });
+    document.getElementById('showvid').onchange = e => { useVid = e.target.checked; vid.hidden = !useVid; if (!useVid) vid.pause(); else cue(playing); };
+  }
   function frame(now) {
-    if (playing) { t += (now - last) / 1000 * HZ * speed; if (t >= N - 1) { t = N - 1; setPlay(false); } requestAnimationFrame(frame); }
+    if (playing) {
+      const onVid = useVid && cur >= 0 && segAt(wall()) === cur && !vid.paused && vid.readyState >= 2;
+      if (onVid) t = (segs[cur].start + vid.currentTime - D.t0) * HZ;
+      else if (!(useVid && cur >= 0 && segAt(wall()) === cur && vid.readyState < 2)) { t += (now - last) / 1000 * HZ * speed; if (useVid && segAt(wall()) !== cur) cue(true); }
+      if (t >= N - 1) { t = N - 1; setPlay(false); }
+      requestAnimationFrame(frame);
+    }
     last = now; draw();
   }
-  function setPlay(on) { playing = on; playBtn.textContent = on ? 'Pause' : 'Play'; if (on) { last = performance.now(); requestAnimationFrame(frame); } }
+  function setPlay(on) { playing = on; playBtn.textContent = on ? 'Pause' : 'Play'; if (on) { last = performance.now(); cue(true); requestAnimationFrame(frame); } else if (segs.length) vid.pause(); }
   playBtn.onclick = () => { if (t >= N - 1) t = 0; setPlay(!playing); };
-  seek.oninput = () => { t = +seek.value; draw(); };
-  document.querySelectorAll('.speed button').forEach(b => b.onclick = () => { speed = +b.dataset.s; document.querySelectorAll('.speed button').forEach(o => o.setAttribute('aria-pressed', o === b)); });
+  seek.oninput = () => { t = +seek.value; cue(playing); draw(); };
+  document.querySelectorAll('.speed button').forEach(b => b.onclick = () => { speed = +b.dataset.s; vid.playbackRate = speed; document.querySelectorAll('.speed button').forEach(o => o.setAttribute('aria-pressed', o === b)); });
   document.getElementById('trails').onchange = draw; document.getElementById('names').onchange = draw;
-  const jump = k => { t = Math.max(0, Math.min(N - 1, k - D.k0 - 3 * HZ)); draw(); cv.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); };
+  const jump = k => { t = Math.max(0, Math.min(N - 1, k - D.k0 - 3 * HZ)); cue(playing); draw(); cv.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); };
 
   // timeline marks
   const marks = document.getElementById('marks');
@@ -215,7 +246,7 @@ const DATA = /*DATA*/null/*END*/;
     for (const p of D.players) { const q = at(p.a, t); if (!q) continue; const d = Math.hypot(X(q[0]) - mx, Y(q[1]) - my); if (d < bd) { bd = d; best = p.id; } } sel = best === sel ? null : best; table(); draw(); };
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw); addEventListener('resize', draw);
   new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
-  table(); eventsList(); draw();
+  table(); eventsList(); cue(false); draw();
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(draw);
 })();
 </script>

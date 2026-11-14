@@ -53,6 +53,11 @@ def load_embeddings(T, emb_dir, raw_dir):
             pos = np.clip(pos, 0, len(src) - 1)
             hit = src[order][pos] == key
             E[order[pos[hit]]] = d["emb"][hit].astype(np.float32)
+        # centre on this camera's average player: what is left is what tells people apart here
+        has = np.abs(E).sum(1) > 0
+        if has.sum() > 100:
+            E[has] -= E[has].mean(0)
+            E[has] /= np.maximum(np.linalg.norm(E[has], axis=1, keepdims=True), 1e-9)
         out.append(E)
     return out
 
@@ -261,7 +266,22 @@ def assign(C, labels, K, max_cost, rounds=3, cont_w=0.5):
     ids, tot = [], []
     for l in np.unique(labels[labels >= 0]):
         ids.append(l); tot.append(C["n"][labels == l].sum())
-    seeds = [ids[i] for i in np.argsort(tot)[::-1][:K]]
+    # two different people are on the pitch at the same time; two clusters that never coexist are
+    # usually one person split in two, so only clusters that overlap every earlier seed become seeds
+    k_lo, k_hi = int(C["ks"].min()), int(C["ke"].max()) + 1
+    def occupancy(l):
+        occ = np.zeros(k_hi - k_lo, bool)
+        for j in np.flatnonzero(labels == l):
+            occ[C["ks"][j] - k_lo:C["ke"][j] - k_lo + 1] = True
+        return occ
+    seeds, occs = [], []
+    for i in np.argsort(tot)[::-1]:
+        if len(seeds) >= K or tot[i] * DT < 60:
+            break
+        o = occupancy(ids[i])
+        # compare with the overlap two independent players with this much coverage would have
+        if all((o & p).sum() * len(o) >= 0.3 * o.sum() * p.sum() for p in occs):
+            seeds.append(ids[i]); occs.append(o)
     lab = np.full(len(labels), -1)
     for new, l in enumerate(seeds):
         lab[labels == l] = new
