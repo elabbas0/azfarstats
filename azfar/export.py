@@ -17,6 +17,31 @@ def segs(a):
     return [[int(s), np.round(a[s:e] * 10).astype(int).ravel().tolist()] for s, e in zip(edges[::2], edges[1::2])]
 
 
+def grid_ball_z(B, k0, k1):
+    z = np.full(k1 - k0, np.nan)
+    ok = (B["k"] >= k0) & (B["k"] < k1)
+    z[B["k"][ok] - k0] = B["z"][ok]
+    return np.where(np.isnan(z), np.nan, z)
+
+
+def clock_offsets(raw, osd_dir, ch, t0, t1, step=5):
+    """Camera clock minus our timeline, sampled every `step` seconds (tenths of a second)."""
+    v = []
+    clips = [c for c in scan(raw) if c.ch == ch]
+    have = {c.path: os.path.join(osd_dir, os.path.basename(c.path).replace(".mp4", ".npy")) for c in clips}
+    if not all(os.path.exists(p) for p in have.values()):
+        return None
+    osd = {c.path: np.load(have[c.path]) for c in clips}
+    for t in np.arange(t0, t1, step):
+        for c in clips:
+            i = int(round((t - c.t0) * 15))
+            if 0 <= i < c.n_frames:
+                v.append(int(round((osd[c.path][i] - t) * 10))); break
+        else:
+            v.append(v[-1] if v else 0)
+    return dict(t0=float(t0), step=step, v=v)
+
+
 def thumbnail(I, T, pid, clips, height=104):
     """Best single view of a player: big, confident, alone in the frame."""
     m = np.flatnonzero(I["pid"] == pid)
@@ -66,6 +91,8 @@ def main():
     ap.add_argument("--session", default="config/session.json")
     ap.add_argument("--out", default="data/out/replay.html")
     ap.add_argument("--no-thumbs", action="store_true")
+    ap.add_argument("--calib", default="config/calibration.json")
+    ap.add_argument("--osd", default="data/osd", help="burnt-in clock readings from azfar.osd")
     ap.add_argument("--video", default="data/out/video", help="folder with split-view segments (see azfar.video)")
     a = ap.parse_args()
     I, T, B = np.load(a.ids), np.load(a.tracks), np.load(a.ball)
@@ -111,6 +138,22 @@ def main():
         have = [s for s in json.load(open(seg_file)) if os.path.exists(os.path.join(a.video, s["src"]))]
         if have:
             data["video"] = dict(base="video/", segments=have)
+    # camera models for drawing on the split video (left = first camera, right = second)
+    from .camera import Camera
+    calib = json.load(open(a.calib))
+    data["cams"] = []
+    for n_, ch in enumerate(sorted(calib["cameras"])):
+        cam = Camera.from_dict(calib["cameras"][ch])
+        data["cams"].append(dict(R=cam.R.ravel().round(6).tolist(), C=cam.C.round(4).tolist(), f=cam.f, k1=cam.k1, k2=cam.k2,
+                                 cx=cam.cx, cy=cam.cy, flip=cam.flip, x0=640 * n_))
+    data["ballz"] = segs(np.c_[grid_ball_z(B, k0, k1), np.zeros(k1 - k0)])
+    data["ballz"] = [[s_, v[::2]] for s_, v in data["ballz"]]
+    # the camera's burnt-in clock: offset from our timeline every 5 s, in tenths of a second
+    clk = clock_offsets(a.raw, a.osd, sorted(calib["cameras"])[0], k0 / GRID_HZ, k1 / GRID_HZ)
+    if clk is not None:
+        data["clock"] = clk
+        for ev_ in data["events"]:
+            ev_["time"] = fmt(ev_["k"] / GRID_HZ + clk["v"][min(len(clk["v"]) - 1, max(0, int((ev_["k"] / GRID_HZ - clk["t0"]) // clk["step"])))] / 10)
     tpl = open(os.path.join(os.path.dirname(__file__), "replay_template.html")).read()
     html = tpl.replace("/*DATA*/null/*END*/", json.dumps(data, separators=(",", ":")).replace("</", "<\\/"))
     os.makedirs(os.path.dirname(a.out), exist_ok=True)

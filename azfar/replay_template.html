@@ -24,7 +24,10 @@ header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; }
 h1 { font-family: var(--display); font-size: 1.6rem; margin: 0; letter-spacing: -0.01em; }
 .sub { color: var(--ink-2); font-size: 0.9rem; }
 .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.vbox { position: relative; }
 #vid { display: block; width: 100%; aspect-ratio: 32 / 9; background: #000; }
+#vov { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.togs { display: flex; flex-wrap: wrap; gap: 6px 14px; }
 .vidcap { display: flex; flex-wrap: wrap; gap: 6px 16px; justify-content: space-between; align-items: center; padding: 8px 14px; color: var(--ink-2); font-size: 0.85rem; border-bottom: 1px solid var(--line); }
 canvas#pitch { display: block; width: 100%; height: auto; background: var(--turf); touch-action: manipulation; }
 .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 10px 14px; }
@@ -75,8 +78,8 @@ tbody tr.sel td { background: var(--hi); }
   </header>
   <section class="stage" aria-label="Top-down replay">
     <div id="vidwrap" hidden>
-      <video id="vid" playsinline muted preload="metadata" aria-label="Both cameras side by side: camera 2 left, camera 3 right"></video>
-      <div class="vidcap"><span>Camera 2 (left) and camera 3 (right), aligned on the computed timeline. Each picture carries its own burnt-in clock.</span><label class="tog"><input type="checkbox" id="showvid" checked> Show video</label></div>
+      <div class="vbox"><video id="vid" playsinline muted preload="auto" aria-label="Both cameras side by side: camera 2 left, camera 3 right"></video><canvas id="vov" width="1280" height="360" aria-hidden="true"></canvas></div>
+      <div class="vidcap"><span id="vidmsg">Camera 2 (left) and camera 3 (right). The red ring is where the tracker puts the ball; numbers are the tracked players.</span><span class="togs"><label class="tog"><input type="checkbox" id="showvid" checked> Video</label><label class="tog"><input type="checkbox" id="overlay" checked> Ball and players on video</label></span></div>
     </div>
     <canvas id="pitch" width="1200" height="640" role="img" aria-label="Pitch seen from above with player and ball positions"></canvas>
     <div class="bar">
@@ -128,6 +131,39 @@ const DATA = /*DATA*/null/*END*/;
   document.getElementById('meta').textContent = D.title;
   document.getElementById('note').textContent = D.note;
 
+  // --- overlay: project tracked positions into each camera picture of the split video
+  const vov = document.getElementById('vov'), ox2 = vov.getContext('2d');
+  const ballz = (() => { const a = new Float32Array(N).fill(0); for (const [s0, v] of (D.ballz || [])) for (let i = 0; i < v.length; i++) a[s0 + i] = v[i] / 10; return a; })();
+  function project(c, x, y, h) {
+    let px = x, py = y; if (c.flip) { px = c.flip[0] - x; py = c.flip[1] - y; }
+    const d0 = px - c.C[0], d1 = py - c.C[1], d2 = -h - c.C[2], R = c.R;
+    const a = R[0] * d0 + R[1] * d1 + R[2] * d2, b = R[3] * d0 + R[4] * d1 + R[5] * d2, z = R[6] * d0 + R[7] * d1 + R[8] * d2;
+    const r = Math.hypot(a, b); if (r < 1e-9) return null;
+    const th = Math.atan2(r, z), thd = th * (1 + c.k1 * th * th + c.k2 * th ** 4);
+    const u = (c.cx + c.f * thd / r * a) / 3, v = (c.cy + c.f * thd / r * b) / 3;
+    if (u < 0 || u >= 640 || v < 0 || v >= 360) return null;
+    return [u + c.x0, v];
+  }
+  function drawOverlay() {
+    ox2.clearRect(0, 0, 1280, 360);
+    if (!document.getElementById('overlay').checked || !(D.cams || []).length) return;
+    ox2.font = '600 13px Inter, sans-serif'; ox2.textAlign = 'center'; ox2.textBaseline = 'bottom';
+    for (const c of D.cams) {
+      for (const p of D.players) {
+        const q = at(p.a, t); if (!q) continue;
+        const s2 = project(c, q[0], q[1], 0); if (!s2) continue;
+        ox2.beginPath(); ox2.arc(s2[0], s2[1], 3, 0, 7); ox2.fillStyle = '#ff3df5'; ox2.fill();
+        ox2.lineWidth = 3; ox2.strokeStyle = 'rgba(0,0,0,.8)'; ox2.strokeText(p.label, s2[0], s2[1] - 4); ox2.fillStyle = '#fff'; ox2.fillText(p.label, s2[0], s2[1] - 4);
+      }
+      const b = at(ball, t);
+      if (b) {
+        const i = Math.min(N - 1, Math.max(0, Math.round(t))), s2 = project(c, b[0], b[1], ballz[i]);
+        if (s2) { ox2.beginPath(); ox2.arc(s2[0], s2[1], 9, 0, 7); ox2.lineWidth = 3; ox2.strokeStyle = '#ff2020'; ox2.stroke(); }
+      }
+    }
+  }
+  const clockAt = w => { const o = D.clock; if (!o) return w; const i = Math.min(o.v.length - 1, Math.max(0, Math.floor((w - o.t0) / o.step))); return w + o.v[i] / 10; };
+
   function drawPitch() {
     cx.fillStyle = css('--turf'); cx.fillRect(0, 0, cv.width, cv.height);
     cx.fillStyle = css('--turf-2'); for (let i = 0; i < 8; i += 2) cx.fillRect(X(i * L / 8), Y(0), L / 8 * sc, W * sc);
@@ -155,7 +191,8 @@ const DATA = /*DATA*/null/*END*/;
     }
     const b = at(ball, t);
     if (b) { cx.beginPath(); cx.arc(X(b[0]), Y(b[1]), 6 * z, 0, 7); cx.fillStyle = '#fff'; cx.fill(); cx.lineWidth = 2; cx.strokeStyle = '#111'; cx.stroke(); }
-    clock.textContent = fmt(D.t0 + t / HZ);
+    clock.textContent = fmt(clockAt(D.t0 + t / HZ));
+    drawOverlay();
     if (document.activeElement !== seek) seek.value = Math.floor(t);
   }
   // --- video: when segments exist, the video is the master clock and the top-down view follows it
@@ -167,21 +204,24 @@ const DATA = /*DATA*/null/*END*/;
     if (!useVid) return false;
     const w = wall(), i = segAt(w);
     if (i < 0) { vid.pause(); return false; }
-    const go = () => { try { vid.currentTime = Math.max(0, w - segs[i].start); } catch (e) {} vid.playbackRate = speed; if (andPlay) vid.play().catch(() => {}); };
+    const go = () => { try { vid.currentTime = Math.max(0, w - segs[i].start); } catch (e) {} vid.playbackRate = speed; };
     if (i !== cur) { cur = i; vid.src = D.video.base + segs[i].src; vid.addEventListener('loadedmetadata', go, { once: true }); vid.load(); } else go();
+    // play() is called right here, inside the tap, so phones allow it
+    if (andPlay) vid.play().catch(() => { if (playing) { setPlay(false); document.getElementById('vidmsg').textContent = 'The browser did not start the video. Tap Play again.'; } });
     return true;
   }
   if (segs.length) {
     document.getElementById('vidwrap').hidden = false;
     vid.addEventListener('ended', () => { if (playing && cur + 1 < segs.length) { t = (segs[cur + 1].start - D.t0) * HZ + 0.01; cue(true); } else if (playing) setPlay(false); });
     vid.addEventListener('error', () => { if (!vid.src) return; useVid = false; vid.hidden = true; document.querySelector('.vidcap span').textContent = 'This browser could not play the video segment; the top-down replay still works.'; });
-    document.getElementById('showvid').onchange = e => { useVid = e.target.checked; vid.hidden = !useVid; if (!useVid) vid.pause(); else cue(playing); };
+    document.getElementById('showvid').onchange = e => { useVid = e.target.checked; vid.hidden = !useVid; vov.hidden = !useVid; if (!useVid) vid.pause(); else cue(playing); };
   }
   function frame(now) {
     if (playing) {
-      const onVid = useVid && cur >= 0 && segAt(wall()) === cur && !vid.paused && vid.readyState >= 2;
-      if (onVid) t = (segs[cur].start + vid.currentTime - D.t0) * HZ;
-      else if (!(useVid && cur >= 0 && segAt(wall()) === cur && vid.readyState < 2)) { t += (now - last) / 1000 * HZ * speed; if (useVid && segAt(wall()) !== cur) cue(true); }
+      if (useVid && segAt(wall()) >= 0) {
+        // the top-down view never runs on its own: it shows whatever moment the video is showing
+        if (cur >= 0 && vid.readyState >= 2 && !vid.seeking) t = (segs[cur].start + vid.currentTime - D.t0) * HZ;
+      } else t += (now - last) / 1000 * HZ * speed;
       if (t >= N - 1) { t = N - 1; setPlay(false); }
       requestAnimationFrame(frame);
     }
@@ -189,7 +229,9 @@ const DATA = /*DATA*/null/*END*/;
   }
   function setPlay(on) { playing = on; playBtn.textContent = on ? 'Pause' : 'Play'; if (on) { last = performance.now(); cue(true); requestAnimationFrame(frame); } else if (segs.length) vid.pause(); }
   playBtn.onclick = () => { if (t >= N - 1) t = 0; setPlay(!playing); };
-  seek.oninput = () => { t = +seek.value; cue(playing); draw(); };
+  seek.oninput = () => { t = +seek.value; cue(false); draw(); };
+  seek.onchange = () => { if (playing) cue(true); };
+  if (segs.length) { vid.addEventListener('seeked', () => { if (!playing) draw(); }); document.getElementById('overlay').onchange = draw; }
   document.querySelectorAll('.speed button').forEach(b => b.onclick = () => { speed = +b.dataset.s; vid.playbackRate = speed; document.querySelectorAll('.speed button').forEach(o => o.setAttribute('aria-pressed', o === b)); });
   document.getElementById('trails').onchange = draw; document.getElementById('names').onchange = draw;
   const jump = k => { t = Math.max(0, Math.min(N - 1, k - D.k0 - 3 * HZ)); cue(playing); draw(); cv.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); };

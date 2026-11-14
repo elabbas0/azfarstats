@@ -19,6 +19,7 @@ Put the XVR files (`XVR_ch<N>_main_<start>_<end>.mp4`) in `data/raw/`, then:
 | 7b | `python -m azfar.window --write` | Finds the match window: skips the warm-up (several balls on the pitch at once) and stops where the first camera stops. |
 | 8 | `python -m azfar.identify --start HH:MM:SS --end HH:MM:SS` | Assigns tracklets to a fixed roster of players. |
 | 9 | `python -m azfar.stats` / `python -m azfar.events` | Minutes, distance, speeds, sprints / touches, passes, shots, goals, assists, saves, dribbles. |
+| 9b | `python -m azfar.osd` | Reads the camera's burnt-in clock on every frame (the recorder drops frames, so frame counts drift by a few seconds an hour); the replay shows this clock. |
 | 10 | `python -m azfar.video` then `python -m azfar.export` | Split-view video segments and the self-contained replay page (`data/out/replay.html`). |
 
 `python -m azfar.sheet` writes a contact sheet (a row of crops per player) for checking identities
