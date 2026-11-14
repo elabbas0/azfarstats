@@ -1,0 +1,220 @@
+<title>AzFar Match Replay</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap">
+<style>
+/* Layout: scoreboard strip, then the pitch with its transport bar, then tabbed tables underneath. */
+:root {
+  --bg: #f3f5f1; --panel: #ffffff; --ink: #14201a; --ink-2: #51605a; --line: #d9dfd8;
+  --turf: #2f7d4a; --turf-2: #2a7143; --chalk: #e9f3ea; --accent: #0f6b4f; --team-a: #2a78d6; --team-b: #eb6834;
+  --goal: #c79200; --hi: #fff3c4;
+  --display: "Space Grotesk", "Segoe UI", system-ui, sans-serif; --body: Inter, "Segoe UI", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #101613; --panel: #18211c; --ink: #e8efe9; --ink-2: #a3b1a9; --line: #2b3830;
+  --turf: #256a3e; --turf-2: #215f38; --chalk: #cfe3d3; --accent: #58c79d; --team-a: #3987e5; --team-b: #d95926;
+  --goal: #e0b030; --hi: #3a3413; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #101613; --panel: #18211c; --ink: #e8efe9; --ink-2: #a3b1a9; --line: #2b3830;
+  --turf: #256a3e; --turf-2: #215f38; --chalk: #cfe3d3; --accent: #58c79d; --team-a: #3987e5; --team-b: #d95926;
+  --goal: #e0b030; --hi: #3a3413; color-scheme: dark }
+body { background: var(--bg); color: var(--ink); font-family: var(--body); line-height: 1.45;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 20px 40px; }
+.wrap { max-width: 1100px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; }
+h1 { font-family: var(--display); font-size: 1.6rem; margin: 0; letter-spacing: -0.01em; }
+.sub { color: var(--ink-2); font-size: 0.9rem; }
+.stage { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+canvas#pitch { display: block; width: 100%; height: auto; background: var(--turf); touch-action: manipulation; }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 10px 14px; }
+.bar button, .tabs button, .chip { font: inherit; color: var(--ink); background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+.bar button:hover, .tabs button:hover { border-color: var(--accent); }
+.bar button:focus-visible, .tabs button:focus-visible, input:focus-visible, select:focus-visible, tr:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#play { min-width: 76px; background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+#clock { font-family: var(--display); font-size: 1.15rem; font-variant-numeric: tabular-nums; min-width: 5.2em; }
+.speed { display: flex; gap: 4px; }
+.speed button[aria-pressed="true"], .tabs button[aria-selected="true"] { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+label.tog { display: flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 0.9rem; }
+.scrub { position: relative; padding: 0 14px 12px; }
+#seek { width: 100%; margin: 0; }
+#marks { position: relative; height: 14px; margin: 0 8px; }
+#marks i { position: absolute; top: 2px; width: 3px; height: 10px; border-radius: 2px; background: var(--ink-2); opacity: 0.55; transform: translateX(-1px); }
+#marks i.goal { background: var(--goal); opacity: 1; width: 5px; height: 14px; top: 0; }
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 0; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; font-variant-numeric: tabular-nums; }
+th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+th { font-weight: 600; color: var(--ink-2); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; user-select: none; }
+th:first-child, td:first-child { text-align: left; position: sticky; left: 0; background: var(--panel); }
+tbody tr { cursor: pointer; } tbody tr:last-child td { border-bottom: 0; }
+tbody tr.sel td { background: var(--hi); }
+.who { display: flex; align-items: center; gap: 8px; }
+.dot { width: 22px; height: 22px; border-radius: 50%; border: 3px solid var(--ink-2); display: inline-grid; place-items: center; font-size: 0.62rem; font-weight: 600; color: #fff; text-shadow: 0 0 2px #000, 0 0 2px #000; flex: none; }
+.dot.t0 { border-color: var(--team-a); } .dot.t1 { border-color: var(--team-b); }
+.who img { width: 26px; height: 52px; object-fit: cover; border-radius: 3px; background: var(--line); }
+.who small { color: var(--ink-2); display: block; font-size: 0.75rem; }
+#events { max-height: 420px; overflow-y: auto; margin: 0; padding: 0 6px; list-style: none; }
+#events li { display: flex; gap: 12px; padding: 7px 8px; border-bottom: 1px solid var(--line); cursor: pointer; align-items: baseline; }
+#events li:hover { background: var(--hi); }
+#events time { font-variant-numeric: tabular-nums; color: var(--ink-2); min-width: 4.6em; }
+#events b.goal { color: var(--goal); }
+.filters { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; }
+.chip[aria-pressed="true"] { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+.note { color: var(--ink-2); font-size: 0.85rem; max-width: 70ch; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--ink-2); font-size: 0.85rem; padding: 0 14px 10px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 12px; height: 12px; border-radius: 50%; border: 3px solid; }
+@media (max-width: 560px) { h1 { font-size: 1.3rem; } th, td { padding: 6px 8px; } .who img { display: none; } }
+</style>
+<div class="wrap">
+  <header>
+    <h1>AzFar Match Replay</h1>
+    <span class="sub" id="meta"></span>
+  </header>
+  <section class="stage" aria-label="Top-down replay">
+    <canvas id="pitch" width="1200" height="640" role="img" aria-label="Pitch seen from above with player and ball positions"></canvas>
+    <div class="bar">
+      <button id="play" type="button">Play</button>
+      <span id="clock">--:--:--</span>
+      <div class="speed" role="group" aria-label="Playback speed">
+        <button type="button" data-s="1" aria-pressed="true">1×</button><button type="button" data-s="2" aria-pressed="false">2×</button><button type="button" data-s="4" aria-pressed="false">4×</button><button type="button" data-s="8" aria-pressed="false">8×</button>
+      </div>
+      <label class="tog"><input type="checkbox" id="trails" checked> Trails</label>
+      <label class="tog"><input type="checkbox" id="names" checked> Numbers</label>
+    </div>
+    <div class="scrub">
+      <div id="marks" aria-hidden="true"></div>
+      <input type="range" id="seek" min="0" max="1" step="1" value="0" aria-label="Match time">
+    </div>
+    <div class="legend"><span><i class="sw" style="border-color:var(--team-a)"></i>Team A</span><span><i class="sw" style="border-color:var(--team-b)"></i>Team B</span><span><i class="sw" style="border-color:var(--ink-2)"></i>Team not known</span><span>Dot fill = shirt colour. Timeline marks: shots (grey), goals (gold).</span></div>
+  </section>
+  <div class="tabs" role="tablist">
+    <button type="button" role="tab" aria-selected="true" data-tab="players">Players</button>
+    <button type="button" role="tab" aria-selected="false" data-tab="eventsTab">Events</button>
+    <select id="window" aria-label="Period"></select>
+  </div>
+  <section class="panel" id="players"><div class="scroll"><table id="tbl"><thead></thead><tbody></tbody></table></div></section>
+  <section class="panel" id="eventsTab" hidden>
+    <div class="filters" id="filters"></div>
+    <ul id="events"></ul>
+  </section>
+  <p class="note" id="note"></p>
+</div>
+<script>
+const DATA = /*DATA*/null/*END*/;
+(function () {
+  const D = DATA, L = D.pitch.L, W = D.pitch.W, HZ = D.hz, N = D.n;
+  const cv = document.getElementById('pitch'), cx = cv.getContext('2d');
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const pad = 30, sc = Math.min((cv.width - 2 * pad) / L, (cv.height - 2 * pad) / W);
+  const ox = (cv.width - L * sc) / 2, oy = (cv.height - W * sc) / 2;
+  const X = x => ox + x * sc, Y = y => oy + y * sc;
+  const fmt = s => { s = Math.floor(s); const p = n => String(n).padStart(2, '0'); return p(Math.floor(s / 3600)) + ':' + p(Math.floor(s % 3600 / 60)) + ':' + p(s % 60); };
+  // unpack tracks: segs [[start, [x,y,...] in decimetres]] -> Float32Array of N*2 with NaN gaps
+  const unpack = segs => { const a = new Float32Array(N * 2).fill(NaN); for (const [s, v] of segs) for (let i = 0; i < v.length; i++) a[s * 2 + i] = v[i] / 10; return a; };
+  D.players.forEach(p => p.a = unpack(p.segs));
+  const ball = unpack(D.ball);
+  const at = (a, t) => { const i = Math.floor(t), f = t - i; if (i < 0 || i >= N) return null; const x0 = a[i * 2], y0 = a[i * 2 + 1]; if (isNaN(x0)) return null;
+    if (i + 1 < N && !isNaN(a[i * 2 + 2])) return [x0 + (a[i * 2 + 2] - x0) * f, y0 + (a[i * 2 + 3] - y0) * f]; return [x0, y0]; };
+  let t = 0, playing = false, speed = 1, sel = null, last = 0;
+  const seek = document.getElementById('seek'), clock = document.getElementById('clock'), playBtn = document.getElementById('play');
+  seek.max = N - 1;
+  document.getElementById('meta').textContent = D.title;
+  document.getElementById('note').textContent = D.note;
+
+  function drawPitch() {
+    cx.fillStyle = css('--turf'); cx.fillRect(0, 0, cv.width, cv.height);
+    cx.fillStyle = css('--turf-2'); for (let i = 0; i < 8; i += 2) cx.fillRect(X(i * L / 8), Y(0), L / 8 * sc, W * sc);
+    cx.strokeStyle = css('--chalk'); cx.lineWidth = 2.5;
+    cx.strokeRect(X(0), Y(0), L * sc, W * sc);
+    cx.beginPath(); cx.moveTo(X(L / 2), Y(0)); cx.lineTo(X(L / 2), Y(W)); cx.stroke();
+    cx.beginPath(); cx.arc(X(L / 2), Y(W / 2), 3 * sc, 0, 7); cx.stroke();
+    for (const b of D.pitch.boxes) cx.strokeRect(X(Math.min(b.x0, b.x1)), Y(b.y0), Math.abs(b.x1 - b.x0) * sc, (b.y1 - b.y0) * sc);
+    cx.lineWidth = 5; for (const gx of [0, L]) { cx.beginPath(); cx.moveTo(X(gx), Y(W / 2 - 1.5)); cx.lineTo(X(gx), Y(W / 2 + 1.5)); cx.stroke(); }
+  }
+  function draw() {
+    drawPitch();
+    const trails = document.getElementById('trails').checked, names = document.getElementById('names').checked;
+    const tc = [css('--team-a'), css('--team-b')], unk = css('--chalk');
+    for (const p of D.players) {
+      const q = at(p.a, t); if (!q) continue;
+      const ring = p.team === 0 || p.team === 1 ? tc[p.team] : unk, isSel = sel === p.id;
+      if (trails || isSel) { cx.beginPath(); let started = false; const span = isSel ? 10 * HZ : 2 * HZ;
+        for (let i = Math.max(0, Math.floor(t) - span); i <= Math.floor(t); i++) { const x = p.a[i * 2]; if (isNaN(x)) { started = false; continue; } if (!started) { cx.moveTo(X(x), Y(p.a[i * 2 + 1])); started = true; } else cx.lineTo(X(x), Y(p.a[i * 2 + 1])); }
+        cx.strokeStyle = ring; cx.globalAlpha = isSel ? 0.9 : 0.45; cx.lineWidth = isSel ? 3 : 2; cx.stroke(); cx.globalAlpha = 1; }
+      const r = isSel ? 15 : 12;
+      cx.beginPath(); cx.arc(X(q[0]), Y(q[1]), r, 0, 7); cx.fillStyle = p.hex; cx.fill(); cx.lineWidth = isSel ? 5 : 3.5; cx.strokeStyle = ring; cx.stroke();
+      if (names) { cx.font = '600 12px Inter, sans-serif'; cx.textAlign = 'center'; cx.textBaseline = 'middle'; cx.lineWidth = 3; cx.strokeStyle = 'rgba(0,0,0,.75)'; cx.strokeText(p.label, X(q[0]), Y(q[1]) + 0.5); cx.fillStyle = '#fff'; cx.fillText(p.label, X(q[0]), Y(q[1]) + 0.5); }
+    }
+    const b = at(ball, t);
+    if (b) { cx.beginPath(); cx.arc(X(b[0]), Y(b[1]), 6, 0, 7); cx.fillStyle = '#fff'; cx.fill(); cx.lineWidth = 2; cx.strokeStyle = '#111'; cx.stroke(); }
+    clock.textContent = fmt(D.t0 + t / HZ);
+    if (document.activeElement !== seek) seek.value = Math.floor(t);
+  }
+  function frame(now) {
+    if (playing) { t += (now - last) / 1000 * HZ * speed; if (t >= N - 1) { t = N - 1; setPlay(false); } requestAnimationFrame(frame); }
+    last = now; draw();
+  }
+  function setPlay(on) { playing = on; playBtn.textContent = on ? 'Pause' : 'Play'; if (on) { last = performance.now(); requestAnimationFrame(frame); } }
+  playBtn.onclick = () => { if (t >= N - 1) t = 0; setPlay(!playing); };
+  seek.oninput = () => { t = +seek.value; draw(); };
+  document.querySelectorAll('.speed button').forEach(b => b.onclick = () => { speed = +b.dataset.s; document.querySelectorAll('.speed button').forEach(o => o.setAttribute('aria-pressed', o === b)); });
+  document.getElementById('trails').onchange = draw; document.getElementById('names').onchange = draw;
+  const jump = k => { t = Math.max(0, Math.min(N - 1, k - D.k0 - 3 * HZ)); draw(); cv.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); };
+
+  // timeline marks
+  const marks = document.getElementById('marks');
+  for (const e of D.events) if (e.type === 'goal' || e.type === 'shot') { const i = document.createElement('i'); i.className = e.type; i.style.left = ((e.k - D.k0) / (N - 1) * 100) + '%'; marks.appendChild(i); }
+
+  // players table
+  const cols = [['minutes', 'Min'], ['distance_m', 'Dist m'], ['m_per_min', 'm/min'], ['top_speed_kmh', 'Top km/h'], ['sprints', 'Sprints'], ['touch', 'Touches'], ['pass', 'Passes'], ['shot', 'Shots'], ['goal', 'Goals'], ['assist', 'Assists'], ['save', 'Saves'], ['dribble', 'Dribbles'], ['interception', 'Intercept.'], ['tackle', 'Tackles']];
+  const winSel = document.getElementById('window'); Object.keys(D.windows).forEach(w => { const o = document.createElement('option'); o.value = w; o.textContent = w === 'all' ? 'Whole recording' : w + ' (' + D.windows[w].join('–') + ')'; winSel.appendChild(o); });
+  let sortKey = 'minutes', sortDir = -1;
+  const val = (p, k) => { const s = p.stats[winSel.value]; if (!s) return null; return k in s ? s[k] : (s.ev && k in s.ev ? s.ev[k] : 0); };
+  function table() {
+    const th = document.querySelector('#tbl thead'), tb = document.querySelector('#tbl tbody');
+    th.innerHTML = '<tr><th>Player</th>' + cols.map(c => '<th data-k="' + c[0] + '">' + c[1] + (sortKey === c[0] ? (sortDir < 0 ? ' ▾' : ' ▴') : '') + '</th>').join('') + '</tr>';
+    th.querySelectorAll('th[data-k]').forEach(h => h.onclick = () => { if (sortKey === h.dataset.k) sortDir = -sortDir; else { sortKey = h.dataset.k; sortDir = -1; } table(); });
+    const rows = D.players.filter(p => p.stats[winSel.value]).sort((a, b) => sortDir * ((val(a, sortKey) ?? -1) - (val(b, sortKey) ?? -1)));
+    tb.innerHTML = '';
+    for (const p of rows) {
+      const tr = document.createElement('tr'); tr.tabIndex = 0; if (sel === p.id) tr.className = 'sel';
+      const cell = document.createElement('td'); const who = document.createElement('div'); who.className = 'who';
+      const dot = document.createElement('span'); dot.className = 'dot' + (p.team === 0 ? ' t0' : p.team === 1 ? ' t1' : ''); dot.style.background = p.hex; dot.textContent = p.label; who.appendChild(dot);
+      if (p.thumb) { const im = document.createElement('img'); im.src = p.thumb; im.alt = ''; who.appendChild(im); }
+      const nm = document.createElement('span'); nm.textContent = p.name; const sm = document.createElement('small'); sm.textContent = p.desc; nm.appendChild(sm); who.appendChild(nm);
+      cell.appendChild(who); tr.appendChild(cell);
+      for (const c of cols) { const td = document.createElement('td'); const v = val(p, c[0]); td.textContent = v == null ? '–' : v.toLocaleString(); tr.appendChild(td); }
+      const pick = () => { sel = sel === p.id ? null : p.id; table(); draw(); };
+      tr.onclick = pick; tr.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } };
+      tb.appendChild(tr);
+    }
+  }
+  winSel.onchange = table;
+
+  // events list
+  const kinds = ['goal', 'shot', 'save', 'assist', 'pass', 'dribble', 'interception', 'tackle'];
+  const on = new Set(['goal', 'shot', 'save', 'assist']);
+  const byId = Object.fromEntries(D.players.map(p => [p.id, p]));
+  const nm = id => byId[id] ? byId[id].name : 'unidentified player';
+  const text = e => ({ goal: 'Goal' + (e.player != null ? ' — ' + nm(e.player) : ' (scorer not identified)') + (e.assist != null ? ', assist ' + nm(e.assist) : ''),
+    shot: 'Shot — ' + nm(e.player) + ', ' + e.speed_kmh + ' km/h from ' + e.dist_m + ' m' + (e.on_target ? ', on target' : ', off target'),
+    save: 'Save — ' + nm(e.player), assist: 'Assist — ' + nm(e.player) + ' to ' + nm(e.to), pass: 'Pass — ' + nm(e.player) + ' to ' + nm(e.to) + ', ' + e.metres + ' m',
+    dribble: 'Dribble — ' + nm(e.player) + (e.won ? ', kept the ball' : ', lost it'), interception: 'Interception — ' + nm(e.player), tackle: 'Tackle — ' + nm(e.player) })[e.type];
+  function eventsList() {
+    const f = document.getElementById('filters'); f.innerHTML = '';
+    for (const k of kinds) { const n = D.events.filter(e => e.type === k).length; const b = document.createElement('button'); b.type = 'button'; b.className = 'chip'; b.setAttribute('aria-pressed', on.has(k)); b.textContent = k + ' ' + n; b.onclick = () => { on.has(k) ? on.delete(k) : on.add(k); eventsList(); }; f.appendChild(b); }
+    const ul = document.getElementById('events'); ul.innerHTML = '';
+    const list = D.events.filter(e => on.has(e.type));
+    if (!list.length) { const li = document.createElement('li'); li.textContent = 'No events of the selected kinds were detected.'; ul.appendChild(li); }
+    for (const e of list) { const li = document.createElement('li'); const tm = document.createElement('time'); tm.textContent = e.time; const b = document.createElement(e.type === 'goal' ? 'b' : 'span'); if (e.type === 'goal') b.className = 'goal'; b.textContent = text(e); li.append(tm, b); li.onclick = () => jump(e.k); ul.appendChild(li); }
+  }
+  document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => { document.querySelectorAll('.tabs button').forEach(o => o.setAttribute('aria-selected', o === b)); for (const id of ['players', 'eventsTab']) document.getElementById(id).hidden = id !== b.dataset.tab; });
+  cv.onclick = ev => { const r = cv.getBoundingClientRect(), mx = (ev.clientX - r.left) * cv.width / r.width, my = (ev.clientY - r.top) * cv.height / r.height; let best = null, bd = 22;
+    for (const p of D.players) { const q = at(p.a, t); if (!q) continue; const d = Math.hypot(X(q[0]) - mx, Y(q[1]) - my); if (d < bd) { bd = d; best = p.id; } } sel = best === sel ? null : best; table(); draw(); };
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+  new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  table(); eventsList(); draw();
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(draw);
+})();
+</script>

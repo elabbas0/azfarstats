@@ -48,7 +48,7 @@ def summarise(T, min_len=5):
         S["tid"].append(tid[s]); S["ks"].append(k[s]); S["ke"].append(k[e - 1]); S["n"].append(e - s)
         S["ps"].append(xy[s]); S["pe"].append(xy[e - 1])
         S["vs"].append((xy[s + m] - xy[s]) / ((k[s + m] - k[s]) * DT)); S["ve"].append((xy[e - 1] - xy[e - 1 - m]) / ((k[e - 1] - k[e - 1 - m]) * DT))
-        good = sig[s:e] < 0.8
+        good = (sig[s:e] < 0.8) & ~np.isnan(h[s:e])
         S["h"].append(np.median(h[s:e][good]) if good.sum() >= 3 else np.nan); S["hw"].append(good.sum())
         for c, idx in enumerate((i0[s:e], i1[s:e])):
             idx = idx[idx >= 0]

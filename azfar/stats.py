@@ -116,7 +116,7 @@ def main():
         st, heat = player_stats(I["k"][m], I["xy"][m], pitch, windows)
         if "all" not in st:
             continue
-        good = m & (I["sig"] < 0.8)
+        good = m & (I["sig"] < 0.8) & ~np.isnan(I["h"])
         height = float(np.median(I["h"][good])) if good.sum() > 20 else float("nan")
         cols = {}
         o = 0

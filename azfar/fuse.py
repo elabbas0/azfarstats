@@ -63,10 +63,18 @@ def load_camera_dets(det_dir, clips, cams, ch, pitch):
             top = np.c_[(b[:, 0] + b[:, 2]) / 2, b[:, 1]]
             g, ok = cam.to_ground(foot)
             h = cam.height_at(top, g)
+            # a box that ends above the feet (legs hidden behind someone) puts the foot point too
+            # far away and reads as a very short person: place those from the head instead
+            cut = ok & (h < 1.35)
+            if cut.any():
+                g2, ok2 = cam.to_ground(top[cut], height=1.65)
+                g[cut] = np.where(ok2[:, None], g2, g[cut])
+            aspect = (b[:, 3] - b[:, 1]) / np.maximum(b[:, 2] - b[:, 0], 1)
+            h = np.where(cut | (aspect < 1.7) | (d["conf"][m] < 0.55), np.nan, h)  # height only from clean, upright views
             loc = cam._to_local(np.c_[g, np.zeros(len(g))])
             r = np.linalg.norm(loc - cam.C, axis=1)
             inside = ok & (g[:, 0] > -VIEW_MARGIN) & (g[:, 0] < pitch["L"] + VIEW_MARGIN) & (g[:, 1] > -VIEW_MARGIN) & (g[:, 1] < pitch["W"] + VIEW_MARGIN)
-            inside &= (h > 0.7) & (h < 2.5) & (b[:, 3] < 1075)  # plausible person, feet not cut by the frame
+            inside &= ~(h > 2.4) & (b[:, 3] < 1075)  # not a giant; feet not cut by the frame
             ks.append(d["k"][m][inside]); xy.append(g[inside]); hh.append(h[inside]); conf.append(d["conf"][m][inside])
             feat.append(d["feat"][m][inside]); box.append(b[inside]); rng.append(r[inside])
     cat = lambda L, shape=(0,): np.concatenate(L) if L else np.zeros(shape)
@@ -132,7 +140,7 @@ def run(det_dir, raw_dir, calib_path, offset_ticks=0):
             if i is not None and j is not None:
                 wa, wb = 1 / sigma(views[0]["rng"][i]) ** 2, 1 / sigma(views[1]["rng"][j]) ** 2
                 xy = (views[0]["xy"][i] * wa + views[1]["xy"][j] * wb) / (wa + wb)
-                h = views[0]["h"][i] if wa > wb else views[1]["h"][j]
+                h = np.nanmean([views[0]["h"][i], views[1]["h"][j]]) if not (np.isnan(views[0]["h"][i]) and np.isnan(views[1]["h"][j])) else np.nan
                 fused.append((xy, h, (wa + wb) ** -0.5, views[0]["base"] + i, views[1]["base"] + j))
             elif i is not None:
                 fused.append((views[0]["xy"][i], views[0]["h"][i], sigma(views[0]["rng"][i]), views[0]["base"] + i, -1))
