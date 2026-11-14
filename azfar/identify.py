@@ -31,13 +31,39 @@ def app_dist(Fa, Fb):
     return d
 
 
-def summarise(T, min_len=5):
+def load_embeddings(T, emb_dir, raw_dir):
+    """Attach re-identification embeddings to the per-camera detection tables of tracks.npz.
+    Returns (E0, E1): float32 [n_det, 512] with zero rows where a detection was not embedded."""
+    import os
+    from .timeline import scan
+    from .fuse import SRC_BASE
+    clips = scan(raw_dir)
+    out = []
+    for c in (0, 1):
+        src = T[f"src{c}"]
+        E = np.zeros((len(src), 512), np.float32)
+        order = np.argsort(src)
+        for ci, clip in enumerate(clips):
+            p = os.path.join(emb_dir, os.path.basename(clip.path).replace(".mp4", ".npz"))
+            if not os.path.exists(p):
+                continue
+            d = np.load(p)
+            key = ci * SRC_BASE + d["idx"]
+            pos = np.searchsorted(src[order], key)
+            pos = np.clip(pos, 0, len(src) - 1)
+            hit = src[order][pos] == key
+            E[order[pos[hit]]] = d["emb"][hit].astype(np.float32)
+        out.append(E)
+    return out
+
+
+def summarise(T, min_len=5, E=None):
     """Per-tracklet summary arrays."""
     order = np.lexsort((T["k"], T["tid"]))
     tid, k, xy, h, sig, i0, i1 = (T[n][order] for n in ("tid", "k", "xy", "h", "sig", "i0", "i1"))
     cut = np.flatnonzero(np.diff(tid)) + 1
     starts, ends = np.r_[0, cut], np.r_[cut, len(tid)]
-    S = dict(tid=[], ks=[], ke=[], ps=[], pe=[], vs=[], ve=[], n=[], h=[], hw=[], f0=[], f1=[], n0=[], n1=[], s=[], e=[])
+    S = dict(tid=[], ks=[], ke=[], ps=[], pe=[], vs=[], ve=[], n=[], h=[], hw=[], f0=[], f1=[], n0=[], n1=[], s=[], e=[], emb=[], ne=[])
     feats = (T["feat0"].astype(np.float32), T["feat1"].astype(np.float32))
     rngs = (T["rng0"], T["rng1"])
     boxes = (T["box0"], T["box1"])
@@ -58,12 +84,43 @@ def summarise(T, min_len=5):
             S[f"n{c}"].append(len(idx))
             S[f"f{c}"].append(feats[c][idx].mean(0) if len(idx) else np.zeros(DIM, np.float32))
         S["s"].append(s); S["e"].append(e)
+        acc, cnt = np.zeros(512, np.float32), 0
+        if E is not None:
+            for c, idx in enumerate((i0[s:e], i1[s:e])):
+                idx = idx[idx >= 0]
+                if len(idx):
+                    v = E[c][idx]
+                    has = np.abs(v).sum(1) > 0
+                    acc += v[has].sum(0); cnt += int(has.sum())
+        S["emb"].append(acc); S["ne"].append(cnt)   # emb is the SUM of unit vectors; normalise when comparing
     S = {k_: np.array(v) for k_, v in S.items()}
     return S, dict(tid=tid, k=k, xy=xy, h=h, sig=sig, i0=i0, i1=i1)
 
 
-def pair_app(S, ia, ib, min_n=4):
-    """Appearance distance between summaries ia and ib (arrays of indices); nan when not comparable."""
+def emb_dist(A, B):
+    """Cosine distance between (summed) embedding arrays."""
+    na = np.linalg.norm(A, axis=-1); nb = np.linalg.norm(B, axis=-1)
+    return 1.0 - (A * B).sum(-1) / np.maximum(na * nb, 1e-9)
+
+
+EMB_SCALE = 1.0  # set by calibrate_scale(): maps embedding distance onto the colour-distance scale
+
+
+def pair_app(S, ia, ib, min_n=4, chunk=100_000):
+    """Appearance distance between summaries ia and ib (arrays of indices); nan when not comparable.
+    Uses re-identification embeddings when both sides have them, clothing colours otherwise."""
+    ia, ib = np.asarray(ia), np.asarray(ib)
+    if len(ia) > chunk:  # keep memory flat for millions of pairs
+        return np.concatenate([pair_app(S, ia[o:o + chunk], ib[o:o + chunk], min_n, chunk) for o in range(0, len(ia), chunk)])
+    col = _pair_colour(S, ia, ib, min_n)
+    if "ne" not in S:
+        return col
+    both = (S["ne"][ia] >= 1) & (S["ne"][ib] >= 1)
+    e = emb_dist(S["emb"][ia], S["emb"][ib]) * EMB_SCALE
+    return np.where(both, e, col)
+
+
+def _pair_colour(S, ia, ib, min_n=4):
     num = np.zeros(len(ia)); den = np.zeros(len(ia))
     for c in (0, 1):
         ok = (S[f"n{c}"][ia] >= min_n) & (S[f"n{c}"][ib] >= min_n)
@@ -130,13 +187,15 @@ class Chains:
 
 
 def chain_summary(S, members):
-    """Aggregate tracklet summaries per chain."""
+    """Aggregate tracklet summaries per chain (same keys as S, so pair_app works on chains too)."""
     n = len(members)
     C = dict(ks=np.zeros(n, int), ke=np.zeros(n, int), n=np.zeros(n, int), h=np.full(n, np.nan), hw=np.zeros(n),
-             f0=np.zeros((n, DIM), np.float32), f1=np.zeros((n, DIM), np.float32), n0=np.zeros(n), n1=np.zeros(n))
+             f0=np.zeros((n, DIM), np.float32), f1=np.zeros((n, DIM), np.float32), n0=np.zeros(n), n1=np.zeros(n),
+             emb=np.zeros((n, 512), np.float32), ne=np.zeros(n, int), ps=np.zeros((n, 2)), pe=np.zeros((n, 2)))
     for j, m in enumerate(members):
         m = np.array(m)
         C["ks"][j], C["ke"][j], C["n"][j] = S["ks"][m].min(), S["ke"][m].max(), S["n"][m].sum()
+        C["ps"][j], C["pe"][j] = S["ps"][m[np.argmin(S["ks"][m])]], S["pe"][m[np.argmax(S["ke"][m])]]
         w = S["hw"][m] * ~np.isnan(S["h"][m])
         if w.sum() > 0:
             C["h"][j] = np.nansum(S["h"][m] * w) / w.sum(); C["hw"][j] = w.sum()
@@ -145,103 +204,187 @@ def chain_summary(S, members):
             C[f"n{c}"][j] = w.sum()
             if w.sum() > 0:
                 C[f"f{c}"][j] = (S[f"f{c}"][m] * w[:, None]).sum(0) / w.sum()
+        C["emb"][j] = S["emb"][m].sum(0); C["ne"][j] = S["ne"][m].sum()
     return C
 
 
-def cluster(S, members, min_chain=25, stop=0.20, h_scale=0.12):
-    """Constrained average-linkage clustering of chains. Returns label per chain (-1 = too short)."""
-    C = chain_summary(S, members)
-    big = np.flatnonzero((C["n"] >= min_chain) & ((C["n0"] >= 5) | (C["n1"] >= 5)))
+def reach_conflict(a_ke, a_pe, b_ks, b_ps):
+    """True if going from the end of span a to the start of the later span b is physically impossible."""
+    gap = (b_ks - a_ke) * DT
+    return gap <= 0 or np.hypot(*(b_ps - a_pe)) > 2.0 + VMAX * gap
+
+
+def cluster(C, stop, min_chain=25, h_scale=0.05):
+    """Constrained average-linkage clustering of the longer chains. Returns label per chain (-1 = left out)."""
+    big = np.flatnonzero((C["n"] >= min_chain) & ((C["ne"] >= 2) | (C["n0"] >= 5) | (C["n1"] >= 5)))
     n = len(big)
-    print(f"clustering {n} chains (of {len(members)})")
-    # occupancy intervals per chain (list of tracklet spans) for the cannot-link test
-    spans = [np.array([(S["ks"][i], S["ke"][i], *S["ps"][i], *S["pe"][i]) for i in members[j]]) for j in big]
-
-    def conflict(sa, sb):
-        # overlap in time, or unreachable between consecutive pieces
-        for a in sa:
-            ov = (sb[:, 0] <= a[1]) & (sb[:, 1] >= a[0])
-            if ov.any():
-                return True
-            aft = sb[sb[:, 0] > a[1]]
-            if len(aft):
-                b = aft[np.argmin(aft[:, 0])]
-                gap = (b[0] - a[1]) * DT
-                if np.hypot(b[2] - a[4], b[3] - a[5]) > 2.0 + VMAX * gap:
-                    return True
-            bef = sb[sb[:, 1] < a[0]]
-            if len(bef):
-                b = bef[np.argmax(bef[:, 1])]
-                gap = (a[0] - b[1]) * DT
-                if np.hypot(a[2] - b[4], a[3] - b[5]) > 2.0 + VMAX * gap:
-                    return True
-        return False
-
     ii, jj = np.triu_indices(n, 1)
-    D = np.full((n, n), np.inf, np.float32)
-    num = np.zeros(len(ii)); den = np.zeros(len(ii))
-    for c in (0, 1):
-        ok = (C[f"n{c}"][big][ii] >= 5) & (C[f"n{c}"][big][jj] >= 5)
-        d = app_dist(C[f"f{c}"][big][ii], C[f"f{c}"][big][jj])
-        w = np.sqrt(np.minimum(C[f"n{c}"][big][ii], C[f"n{c}"][big][jj])) * ok
-        num += w * d; den += w
-    d = np.where(den > 0, num / np.maximum(den, 1e-9), np.inf)
+    d = pair_app(C, big[ii], big[jj])
     dh = np.abs(C["h"][big][ii] - C["h"][big][jj])
     d = d + np.where(np.isnan(dh), 0.0, np.minimum(dh, 0.3) / 0.3 * h_scale)
+    d = np.where(np.isnan(d), np.inf, d)
+    # cannot-link: overlap in time, or unreachable
+    ks, ke, ps, pe = C["ks"][big], C["ke"][big], C["ps"][big], C["pe"][big]
+    overlap = (ks[ii] <= ke[jj]) & (ks[jj] <= ke[ii])
+    first = np.where(ke[ii] < ks[jj], ii, jj); second = np.where(ke[ii] < ks[jj], jj, ii)
+    gap = np.maximum((ks[second] - ke[first]) * DT, 0)
+    unreachable = np.linalg.norm(ps[second] - pe[first], axis=1) > 2.0 + VMAX * gap
+    d[overlap | unreachable] = np.inf
+    D = np.full((n, n), np.inf, np.float32)
     D[ii, jj] = d; D[jj, ii] = d
-    for a in range(n):  # constraints (vectorised on the cheap overlap test first)
-        for b in range(a + 1, n):
-            if np.isfinite(D[a, b]) and D[a, b] < stop * 2 and conflict(spans[a], spans[b]):
-                D[a, b] = D[b, a] = np.inf
-    # average linkage with constraint propagation
     label = np.arange(n)
     size = C["n"][big].astype(float).copy()
-    alive = np.ones(n, bool)
-    Dm = D.copy()
-    np.fill_diagonal(Dm, np.inf)
     while True:
-        flat = np.argmin(Dm)
+        flat = int(np.argmin(D))
         a, b = divmod(flat, n)
-        if not np.isfinite(Dm[a, b]) or Dm[a, b] > stop:
+        if not np.isfinite(D[a, b]) or D[a, b] > stop:
             break
         wa, wb = size[a], size[b]
-        new = (Dm[a] * wa + Dm[b] * wb) / (wa + wb)  # inf propagates = cannot-link
-        Dm[a], Dm[:, a] = new, new
-        Dm[a, a] = np.inf
-        Dm[b], Dm[:, b] = np.inf, np.inf
-        size[a] += size[b]; alive[b] = False
+        new = (D[a] * wa + D[b] * wb) / (wa + wb)  # inf propagates = cannot-link
+        D[a], D[:, a] = new, new
+        D[a, a] = np.inf
+        D[b], D[:, b] = np.inf, np.inf
+        size[a] += size[b]
         label[label == b] = a
-    out = np.full(len(members), -1)
+    out = np.full(len(C["n"]), -1)
     out[big] = label
-    return out, C
+    return out
+
+
+def assign(C, labels, K, max_cost, rounds=3, cont_w=0.5):
+    """Give every chain one of K identities (or -1).
+
+    Identities start as the K biggest clusters. Each round rebuilds their appearance prototypes and
+    re-assigns all chains, longest first, to the best identity that is free at that time and could
+    physically have been there; continuity with what the identity did just before/after counts too."""
+    import bisect
+    ids, tot = [], []
+    for l in np.unique(labels[labels >= 0]):
+        ids.append(l); tot.append(C["n"][labels == l].sum())
+    seeds = [ids[i] for i in np.argsort(tot)[::-1][:K]]
+    lab = np.full(len(labels), -1)
+    for new, l in enumerate(seeds):
+        lab[labels == l] = new
+    K = len(seeds)
+    order = np.argsort(-C["n"], kind="stable")
+    nC = len(C["n"])
+    for rnd in range(rounds):
+        # prototypes appended after the chains so pair_app can compare chain i with prototype nC + k
+        X = {key: np.concatenate([C[key], np.zeros((K,) + C[key].shape[1:], C[key].dtype)]) for key in ("f0", "f1", "n0", "n1", "emb", "ne")}
+        Hk = np.full(K, np.nan)
+        for k_ in range(K):
+            m = np.flatnonzero(lab == k_)
+            if not len(m):
+                continue
+            X["emb"][nC + k_] = C["emb"][m].sum(0); X["ne"][nC + k_] = C["ne"][m].sum()
+            for c in (0, 1):
+                w = C[f"n{c}"][m]
+                X[f"n{c}"][nC + k_] = w.sum()
+                if w.sum() > 0:
+                    X[f"f{c}"][nC + k_] = (C[f"f{c}"][m] * w[:, None]).sum(0) / w.sum()
+            w = C["hw"][m] * ~np.isnan(C["h"][m])
+            if w.sum() > 0:
+                Hk[k_] = np.nansum(C["h"][m] * w) / w.sum()
+        app = np.stack([pair_app(X, np.arange(nC), np.full(nC, nC + k_)) for k_ in range(K)], 1)  # [chains, K]
+        dh = np.abs(C["h"][:, None] - Hk[None])
+        app = app + np.where(np.isnan(dh), 0.0, np.minimum(dh, 0.3) / 0.3 * 0.05)
+        new_lab = np.full(nC, -1)
+        starts = [[] for _ in range(K)]   # per identity: sorted chain start ticks and the chain ids
+        who = [[] for _ in range(K)]
+        for j in order:
+            best, arg = max_cost, -1
+            for k_ in range(K):
+                pos = bisect.bisect_left(starts[k_], C["ks"][j])
+                prv = who[k_][pos - 1] if pos > 0 else None
+                nxt = who[k_][pos] if pos < len(who[k_]) else None
+                if prv is not None and (C["ke"][prv] >= C["ks"][j] or reach_conflict(C["ke"][prv], C["pe"][prv], C["ks"][j], C["ps"][j])):
+                    continue
+                if nxt is not None and (C["ks"][nxt] <= C["ke"][j] or reach_conflict(C["ke"][j], C["pe"][j], C["ks"][nxt], C["ps"][nxt])):
+                    continue
+                cont = 0.0
+                for a_, b_ in ((prv, j), (j, nxt)):
+                    if a_ is None or b_ is None:
+                        continue
+                    gap = (C["ks"][b_] - C["ke"][a_]) * DT
+                    dist = np.hypot(*(C["ps"][b_] - C["pe"][a_]))
+                    cont = max(cont, np.exp(-gap / 3.0) * max(0.0, 1 - dist / (1.5 + 3.0 * gap)))
+                a = app[j, k_]
+                if np.isnan(a):
+                    if cont < 0.5:      # nothing to recognise them by: needs a clear hand-over
+                        continue
+                    a = max_cost * 0.9
+                cost = a - cont_w * cont * max_cost
+                if cost < best:
+                    best, arg = cost, k_
+            if arg >= 0:
+                new_lab[j] = arg
+                pos = bisect.bisect_left(starts[arg], C["ks"][j])
+                starts[arg].insert(pos, C["ks"][j]); who[arg].insert(pos, j)
+        lab = new_lab
+        print(f"  assignment round {rnd}: {(lab >= 0).sum()} chains, {C['n'][lab >= 0].sum() / C['n'].sum() * 100:.0f}% of observations")
+    return lab
+
+
+def separability(S):
+    """Same-person vs different-person appearance distances, to set thresholds from the data itself:
+    same = two halves of one long tracklet chain; different = chains on the pitch at the same time."""
+    big = np.flatnonzero((S["n"] >= 40) & (S["ne"] >= 2))
+    ii, jj = np.triu_indices(len(big), 1)
+    ov = (S["ks"][big][ii] <= S["ke"][big][jj]) & (S["ks"][big][jj] <= S["ke"][big][ii])
+    d = pair_app(S, big[ii[ov]], big[jj[ov]])
+    return d[~np.isnan(d)]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tracks", default="data/tracks.npz")
+    ap.add_argument("--emb", default="data/emb")
+    ap.add_argument("--raw", default="data/raw")
     ap.add_argument("--out", default="data/identities.npz")
-    ap.add_argument("--stop", type=float, default=0.20)
-    ap.add_argument("--min-seconds", type=float, default=120, help="drop identities seen for less than this")
+    ap.add_argument("--players", type=int, default=0, help="number of people on the pitch (0 = estimate)")
+    ap.add_argument("--stop", type=float, default=0.0, help="clustering threshold (0 = from data)")
+    ap.add_argument("--start", default="", help="only identify within this wall-clock window (HH:MM:SS)")
+    ap.add_argument("--end", default="")
     a = ap.parse_args()
     T = dict(np.load(a.tracks))
-    S, O = summarise(T)
+    if a.start and a.end:
+        hms = lambda s: sum(int(p) * m for p, m in zip(s.split(":"), (3600, 60, 1)))
+        w = (T["k"] >= hms(a.start) * GRID_HZ) & (T["k"] < hms(a.end) * GRID_HZ)
+        for key in ("tid", "k", "xy", "h", "sig", "i0", "i1"):
+            T[key] = T[key][w]
+    E = load_embeddings(T, a.emb, a.raw)
+    have = sum(int((np.abs(e).sum(1) > 0).sum()) for e in E)
+    print(f"embeddings for {have} detections")
+    S, O = summarise(T, E=E if have else None)
+    # thresholds from the data: different people on the pitch at the same time set the scale
+    diff = separability(S) if have else np.array([])
+    if a.stop > 0:
+        stop = a.stop
+    elif len(diff) > 100:
+        stop = float(np.percentile(diff, 3))
+    else:
+        stop = 0.20
+    print(f"different-player distance percentiles 1/3/10/50: {np.percentile(diff, [1, 3, 10, 50]).round(3) if len(diff) else 'n/a'} -> merge threshold {stop:.3f}")
     ch = Chains(S)
-    nl = ch.link_short_gaps()
+    nl = ch.link_short_gaps(app_max=stop * 1.5)
+    C = chain_summary(S, ch.members)
     print(f"{len(S['tid'])} tracklets -> {len(ch.members)} chains ({nl} links)")
-    lab, C = cluster(S, ch.members, stop=a.stop)
-    ids, cnt = np.unique(lab[lab >= 0], return_counts=True)
-    secs = {i: sum(C["n"][j] for j in np.flatnonzero(lab == i)) * DT for i in ids}
-    keep = sorted([i for i in ids if secs[i] >= a.min_seconds], key=lambda i: -secs[i])
-    print(f"{len(ids)} clusters, {len(keep)} with >= {a.min_seconds:.0f}s; seconds: {[int(secs[i]) for i in keep]}")
+    lab0 = cluster(C, stop)
+    u, k = np.unique(T["k"], return_counts=True)
+    K = a.players or int(np.percentile(k[(u >= T['k'].min()) & (u <= T['k'].max())], 75))
+    print(f"people on the pitch: {K}; clusters before assignment: {len(np.unique(lab0[lab0 >= 0]))}")
+    lab = assign(C, lab0, K, max_cost=stop * 2.0)
     pid_of_obs = np.full(len(O["k"]), -1)
-    for new, i in enumerate(keep):
-        for j in np.flatnonzero(lab == i):
+    secs = [C["n"][lab == k_].sum() * DT for k_ in range(lab.max() + 1)]
+    rank = np.argsort(secs)[::-1]
+    for new, k_ in enumerate(rank):
+        for j in np.flatnonzero(lab == k_):
             for t in ch.members[j]:
                 pid_of_obs[S["s"][t]:S["e"][t]] = new
     m = pid_of_obs >= 0
     np.savez_compressed(a.out, pid=pid_of_obs[m], k=O["k"][m], xy=O["xy"][m], h=O["h"][m], sig=O["sig"][m],
                         i0=O["i0"][m], i1=O["i1"][m])
-    print(f"assigned {m.mean() * 100:.0f}% of observations to {len(keep)} identities")
+    print(f"assigned {m.sum() / len(T['k']) * 100:.0f}% of all observations to {len(rank)} identities; minutes each: {[round(secs[k_] / 60) for k_ in rank]}")
 
 
 if __name__ == "__main__":

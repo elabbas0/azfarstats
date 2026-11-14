@@ -1,0 +1,6 @@
+{
+ "_doc": "Per-recording settings. matches: play windows (wall-clock). names: {player id: name}. teams: {player id: 0 or 1} overrides the automatic split.",
+ "matches": [{"name": "Match", "start": "18:11:00", "end": "20:04:00"}],
+ "names": {},
+ "teams": {}
+}

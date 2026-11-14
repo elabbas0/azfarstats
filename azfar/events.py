@@ -237,6 +237,30 @@ def run(I, B, pitch, team_override=None):
                 g["assist"] = a[-1]["player"]
                 ev.append(dict(type="assist", t=a[-1]["t"], player=a[-1]["player"], to=s["player"]))
         ev.append(g)
+    # --- probable goals: an on-target shot after which the ball disappears at the goal mouth
+    # (the net hides it from both cameras) and nobody is seen saving it
+    seen = ~np.isnan(ball[:, 0])
+    last_goal_t = -10**9
+    for s_ in shots:
+        if s_.get("goal") or s_.get("saved") or not s_["on_target"]:
+            continue
+        a, b = s_["t"], min(s_["t"] + int(3 * GRID_HZ), len(ball) - 1)
+        idx = np.flatnonzero(seen[a:b + 1]) + a
+        if not len(idx):
+            continue
+        # last sighting before the first long blackout
+        gaps = np.flatnonzero(np.diff(idx) >= 8)
+        last = idx[gaps[0]] if len(gaps) else idx[-1]
+        vanished = (not seen[last + 1:last + 9].any()) if last + 9 < len(ball) else False
+        gx = s_["goal_x"]
+        if vanished and abs(ball[last, 0] - gx) < 2.5 and abs(ball[last, 1] - W / 2) < GOAL_W / 2 + 0.7 and s_["t"] - last_goal_t > 20 * GRID_HZ:
+            s_["goal"] = True; last_goal_t = s_["t"]
+            g = dict(type="goal", t=s_["t"], player=s_["player"], probable=True)
+            a_ = [p_ for p_ in passes if p_["to"] == s_["player"] and 0 <= s_["t"] - p_["t"] < 12 * GRID_HZ]
+            if a_:
+                g["assist"] = a_[-1]["player"]
+                ev.append(dict(type="assist", t=a_[-1]["t"], player=a_[-1]["player"], to=s_["player"]))
+            ev.append(g)
     ev = [e for e in ev if not (e["type"] == "save" and any(s.get("goal") and s["player"] == e["shot_by"] and abs(s["t"] - e["t"]) < 20 for s in shots))]
     ev.sort(key=lambda e: e["t"])
     for e in ev:

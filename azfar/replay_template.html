@@ -136,18 +136,19 @@ const DATA = /*DATA*/null/*END*/;
     drawPitch();
     const trails = document.getElementById('trails').checked, names = document.getElementById('names').checked;
     const tc = [css('--team-a'), css('--team-b')], unk = css('--chalk');
+    const z = Math.min(2.2, Math.max(1, cv.width / (cv.clientWidth || cv.width) * 0.62));  // keep dots legible on small screens
     for (const p of D.players) {
       const q = at(p.a, t); if (!q) continue;
       const ring = p.team === 0 || p.team === 1 ? tc[p.team] : unk, isSel = sel === p.id;
       if (trails || isSel) { cx.beginPath(); let started = false; const span = isSel ? 10 * HZ : 2 * HZ;
         for (let i = Math.max(0, Math.floor(t) - span); i <= Math.floor(t); i++) { const x = p.a[i * 2]; if (isNaN(x)) { started = false; continue; } if (!started) { cx.moveTo(X(x), Y(p.a[i * 2 + 1])); started = true; } else cx.lineTo(X(x), Y(p.a[i * 2 + 1])); }
         cx.strokeStyle = ring; cx.globalAlpha = isSel ? 0.9 : 0.45; cx.lineWidth = isSel ? 3 : 2; cx.stroke(); cx.globalAlpha = 1; }
-      const r = isSel ? 15 : 12;
+      const r = (isSel ? 15 : 12) * z;
       cx.beginPath(); cx.arc(X(q[0]), Y(q[1]), r, 0, 7); cx.fillStyle = p.hex; cx.fill(); cx.lineWidth = isSel ? 5 : 3.5; cx.strokeStyle = ring; cx.stroke();
-      if (names) { cx.font = '600 12px Inter, sans-serif'; cx.textAlign = 'center'; cx.textBaseline = 'middle'; cx.lineWidth = 3; cx.strokeStyle = 'rgba(0,0,0,.75)'; cx.strokeText(p.label, X(q[0]), Y(q[1]) + 0.5); cx.fillStyle = '#fff'; cx.fillText(p.label, X(q[0]), Y(q[1]) + 0.5); }
+      if (names) { cx.font = '600 ' + Math.round(12 * z) + 'px Inter, sans-serif'; cx.textAlign = 'center'; cx.textBaseline = 'middle'; cx.lineWidth = 3; cx.strokeStyle = 'rgba(0,0,0,.75)'; cx.strokeText(p.label, X(q[0]), Y(q[1]) + 0.5); cx.fillStyle = '#fff'; cx.fillText(p.label, X(q[0]), Y(q[1]) + 0.5); }
     }
     const b = at(ball, t);
-    if (b) { cx.beginPath(); cx.arc(X(b[0]), Y(b[1]), 6, 0, 7); cx.fillStyle = '#fff'; cx.fill(); cx.lineWidth = 2; cx.strokeStyle = '#111'; cx.stroke(); }
+    if (b) { cx.beginPath(); cx.arc(X(b[0]), Y(b[1]), 6 * z, 0, 7); cx.fillStyle = '#fff'; cx.fill(); cx.lineWidth = 2; cx.strokeStyle = '#111'; cx.stroke(); }
     clock.textContent = fmt(D.t0 + t / HZ);
     if (document.activeElement !== seek) seek.value = Math.floor(t);
   }
@@ -197,7 +198,7 @@ const DATA = /*DATA*/null/*END*/;
   const on = new Set(['goal', 'shot', 'save', 'assist']);
   const byId = Object.fromEntries(D.players.map(p => [p.id, p]));
   const nm = id => byId[id] ? byId[id].name : 'unidentified player';
-  const text = e => ({ goal: 'Goal' + (e.player != null ? ' — ' + nm(e.player) : ' (scorer not identified)') + (e.assist != null ? ', assist ' + nm(e.assist) : ''),
+  const text = e => ({ goal: (e.probable ? 'Probable goal' : 'Goal') + (e.player != null ? ' — ' + nm(e.player) : ' (scorer not identified)') + (e.assist != null ? ', assist ' + nm(e.assist) : ''),
     shot: 'Shot — ' + nm(e.player) + ', ' + e.speed_kmh + ' km/h from ' + e.dist_m + ' m' + (e.on_target ? ', on target' : ', off target'),
     save: 'Save — ' + nm(e.player), assist: 'Assist — ' + nm(e.player) + ' to ' + nm(e.to), pass: 'Pass — ' + nm(e.player) + ' to ' + nm(e.to) + ', ' + e.metres + ' m',
     dribble: 'Dribble — ' + nm(e.player) + (e.won ? ', kept the ball' : ', lost it'), interception: 'Interception — ' + nm(e.player), tackle: 'Tackle — ' + nm(e.player) })[e.type];
@@ -210,9 +211,9 @@ const DATA = /*DATA*/null/*END*/;
     for (const e of list) { const li = document.createElement('li'); const tm = document.createElement('time'); tm.textContent = e.time; const b = document.createElement(e.type === 'goal' ? 'b' : 'span'); if (e.type === 'goal') b.className = 'goal'; b.textContent = text(e); li.append(tm, b); li.onclick = () => jump(e.k); ul.appendChild(li); }
   }
   document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => { document.querySelectorAll('.tabs button').forEach(o => o.setAttribute('aria-selected', o === b)); for (const id of ['players', 'eventsTab']) document.getElementById(id).hidden = id !== b.dataset.tab; });
-  cv.onclick = ev => { const r = cv.getBoundingClientRect(), mx = (ev.clientX - r.left) * cv.width / r.width, my = (ev.clientY - r.top) * cv.height / r.height; let best = null, bd = 22;
+  cv.onclick = ev => { const r = cv.getBoundingClientRect(), mx = (ev.clientX - r.left) * cv.width / r.width, my = (ev.clientY - r.top) * cv.height / r.height; let best = null, bd = 22 * cv.width / r.width * 0.62;
     for (const p of D.players) { const q = at(p.a, t); if (!q) continue; const d = Math.hypot(X(q[0]) - mx, Y(q[1]) - my); if (d < bd) { bd = d; best = p.id; } } sel = best === sel ? null : best; table(); draw(); };
-  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw); addEventListener('resize', draw);
   new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   table(); eventsList(); draw();
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(draw);

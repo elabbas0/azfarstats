@@ -17,6 +17,7 @@ MIN_CONF = 0.30
 GATE = 2.2            # association gate (m) track <-> detection
 MERGE_GATE = 2.5      # cross-camera merge gate (m) at mid range
 MAX_MISS = 6          # ticks a track may coast
+SRC_BASE = 10_000_000
 CROWD = 0.9           # two players closer than this (m) -> identities are ambiguous
 
 
@@ -34,9 +35,9 @@ def aim_cameras(calib, ch):
 
 def load_camera_dets(det_dir, clips, cams, ch, pitch):
     """All person detections of one camera projected to the pitch. Returns dict of arrays."""
-    ks, xy, hh, conf, feat, box, rng = [], [], [], [], [], [], []
+    ks, xy, hh, conf, feat, box, rng, src = [], [], [], [], [], [], [], []
     balls = []
-    for c in clips:
+    for ci, c in enumerate(clips):
         if c.ch != ch:
             continue
         p = os.path.join(det_dir, os.path.basename(c.path).replace(".mp4", ".npz"))
@@ -77,9 +78,10 @@ def load_camera_dets(det_dir, clips, cams, ch, pitch):
             inside &= ~(h > 2.4) & (b[:, 3] < 1075)  # not a giant; feet not cut by the frame
             ks.append(d["k"][m][inside]); xy.append(g[inside]); hh.append(h[inside]); conf.append(d["conf"][m][inside])
             feat.append(d["feat"][m][inside]); box.append(b[inside]); rng.append(r[inside])
+            src.append(ci * SRC_BASE + np.flatnonzero(sel)[m][inside])  # (clip, row) of the raw detection
     cat = lambda L, shape=(0,): np.concatenate(L) if L else np.zeros(shape)
     out = dict(k=cat(ks).astype(np.int64), xy=cat(xy, (0, 2)), h=cat(hh), conf=cat(conf), feat=cat(feat, (0, DIM)),
-               box=cat(box, (0, 4)), rng=cat(rng))
+               box=cat(box, (0, 4)), rng=cat(rng), src=cat(src).astype(np.int64))
     out["ball"] = np.concatenate(balls) if balls else np.zeros((0, 5))
     return out
 
@@ -122,7 +124,7 @@ def run(det_dir, raw_dir, calib_path, offset_ticks=0):
     V[1]["k"] = V[1]["k"] + offset_ticks
     order = [np.argsort(v["k"], kind="stable") for v in V]
     for v, o in zip(V, order):
-        for key in ("k", "xy", "h", "conf", "feat", "box", "rng"):
+        for key in ("k", "xy", "h", "conf", "feat", "box", "rng", "src"):
             v[key] = v[key][o]
     kmin = min(v["k"].min() for v in V if len(v["k"]))
     kmax = max(v["k"].max() for v in V if len(v["k"]))
@@ -192,6 +194,26 @@ def run(det_dir, raw_dir, calib_path, offset_ticks=0):
                     next_id += 1
     out = {k: np.array(v) for k, v in obs.items()}
     out["xy"] = out["xy"].reshape(-1, 2)
+    # spectators: someone who stays put for half a minute at the edge of the pitch (bench, fence)
+    # is not playing. A goalkeeper also stands still, but in front of the goal, so that zone is exempt.
+    L, W = pitch["L"], pitch["W"]
+    order = np.lexsort((out["k"], out["tid"]))
+    cut = np.flatnonzero(np.diff(out["tid"][order])) + 1
+    drop = np.zeros(len(order), bool)
+    for s, e in zip(np.r_[0, cut], np.r_[cut, len(order)]):
+        idx = order[s:e]
+        p = out["xy"][idx]
+        if (out["k"][idx[-1]] - out["k"][idx[0]]) * DT < 30:
+            continue
+        c = np.median(p, 0)
+        spread = np.percentile(np.linalg.norm(p - c, axis=1), 90)
+        edge = min(c[0], L - c[0], c[1], W - c[1])
+        in_goal_area = abs(c[1] - W / 2) < 4.0
+        if spread < 0.9 and edge < 1.2 and not in_goal_area:
+            drop[idx] = True
+    if drop.any():
+        print(f"dropped {drop.sum()} observations of people standing still at the pitch edge")
+        out = {k: v[~drop] for k, v in out.items()}
     return out, V, pitch
 
 
@@ -206,7 +228,7 @@ def main():
     obs, V, pitch = run(a.det, a.raw, a.calib, a.offset_ticks)
     np.savez_compressed(a.out, **obs,
                         feat0=V[0]["feat"], feat1=V[1]["feat"], box0=V[0]["box"], box1=V[1]["box"],
-                        rng0=V[0]["rng"], rng1=V[1]["rng"], k0=V[0]["k"], k1=V[1]["k"],
+                        rng0=V[0]["rng"], rng1=V[1]["rng"], src0=V[0]["src"], src1=V[1]["src"], conf0=V[0]["conf"], conf1=V[1]["conf"], k0=V[0]["k"], k1=V[1]["k"],
                         ball0=V[0]["ball"], ball1=V[1]["ball"])
     tid, cnt = np.unique(obs["tid"], return_counts=True)
     print(f"{len(obs['k'])} observations, {len(tid)} tracklets, median length {np.median(cnt) * DT:.1f}s, "
