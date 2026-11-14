@@ -15,7 +15,7 @@ Put the XVR files (`XVR_ch<N>_main_<start>_<end>.mp4`) in `data/raw/`, then:
 | 4 | `python -m azfar.drift` | Re-checks each camera's aim every 10 minutes and corrects it. |
 | 5 | `python -m azfar.embed` | Appearance embeddings (OSNet) for each player once per second. |
 | 6 | `python -m azfar.fuse` | Merges both views on the pitch plane into tracklets; drops people off the pitch. |
-| 7 | `python -m azfar.ball` | Single most plausible ball path (triangulated when both cameras see it). |
+| 7 | `python -m azfar.ballscan` then `python -m azfar.ball` | Motion blobs on every frame, then the single most plausible ball path from detector hits and blobs (triangulated when both cameras see it, height solved along the sight line otherwise). |
 | 8 | `python -m azfar.identify --start HH:MM:SS --end HH:MM:SS` | Assigns tracklets to a fixed roster of players. |
 | 9 | `python -m azfar.stats` / `python -m azfar.events` | Minutes, distance, speeds, sprints / touches, passes, shots, goals, assists, saves, dribbles. |
 | 10 | `python -m azfar.video` then `python -m azfar.export` | Split-view video segments and the self-contained replay page (`data/out/replay.html`). |

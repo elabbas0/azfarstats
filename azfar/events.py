@@ -114,7 +114,7 @@ def detect_kickoffs(P, ball, pitch, min_players=6):
                 mx = np.nanmedian(x[present], axis=1)
                 far = np.abs(mx - L / 2) > 1.0     # everyone but the takers stands back in own half
                 if present.sum() >= min_players and far.sum() >= present.sum() - 3 and (mx < L / 2).sum() >= 2 and (mx > L / 2).sum() >= 2:
-                    if not out or e - out[-1] > 20 * GRID_HZ:
+                    if not out or e - out[-1] > 60 * GRID_HZ:   # one restart, however long the players dither
                         out.append(e)
             t = e + 1
         else:
@@ -229,7 +229,7 @@ def run(I, B, pitch, team_override=None):
     for n, t in enumerate(kickoffs):
         if n == 0 and t < 120 * GRID_HZ:
             continue  # the opening kick-off
-        prev = [s for s in shots if t - 90 * GRID_HZ < s["t"] < t - 3 * GRID_HZ]
+        prev = [s for s in shots if t - 90 * GRID_HZ < s["t"] < t - 3 * GRID_HZ and not s.get("goal")]
         g = dict(type="goal", t=t, kickoff=True)
         if prev:
             s = prev[-1]
