@@ -29,7 +29,7 @@ W_MOTION = 0.12      # weight of a motion blob relative to detector confidence
 def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     """All sightings of one camera as sight lines. Time index m = frames at 15 per second since midnight."""
     cams = aim_cameras(calib, ch)
-    M, PX, SZ, CF = [], [], [], []
+    M, PX, SZ, CF, COL = [], [], [], [], []
     PK, PB = [], []
     for c in clips:
         if c.ch != ch:
@@ -44,9 +44,13 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
             PK.append(d["k"][pp]); PB.append(d["box"][pp])
             M.append(d["k"][sel] * STEP); PX.append(np.c_[(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2])
             SZ.append(np.maximum(b[:, 2] - b[:, 0], b[:, 3] - b[:, 1])); CF.append(d["conf"][sel])
+            ps = os.path.join(scan_dir, name) if scan_dir else ""
+            dc = np.load(ps)["det_col"] if ps and os.path.exists(ps) and "det_col" in np.load(ps).files else None
+            COL.append(dc[sel] if dc is not None else np.full((sel.sum(), 3), np.nan, np.float32))
         p = os.path.join(scan_dir, name) if scan_dir else ""
         if p and os.path.exists(p):
             d = np.load(p)
+            COL.append(d["col"] if "col" in d.files else np.full((len(d["f"]), 3), np.nan, np.float32))
             M.append(np.round(c.t0 * FPS).astype(np.int64) + d["f"].astype(np.int64)); PX.append(d["xy"].astype(np.float64))
             SZ.append(d["size"]); CF.append(-(d["bright"] / 255.0))      # negative marks a motion blob (brightness kept)
     det_boxes = None
@@ -54,12 +58,18 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
         pk, pb = np.concatenate(PK), np.concatenate(PB)
         o = np.argsort(pk, kind="stable")
         det_boxes = (pk[o], pb[o])
-    M, PX, SZ, CF = (np.concatenate(x) for x in (M, PX, SZ, CF))
+    M, PX, SZ, CF, COL = (np.concatenate(x) for x in (M, PX, SZ, CF, COL))
     keep = (M >= m_lo) & (M < m_hi)
-    M, PX, SZ, CF = M[keep], PX[keep], SZ[keep], CF[keep]
+    M, PX, SZ, CF, COL = M[keep], PX[keep], SZ[keep], CF[keep], COL[keep]
     mot = CF < 0
     n0 = mot.sum()
     drop = np.zeros(len(M), bool)
+    # 0) colour: the match ball is white/cream. Neon boots, coloured socks and dark shoes are not.
+    sat, val, yel = COL[:, 0], COL[:, 1], COL[:, 2]
+    known = ~np.isnan(sat) & (val > 0)
+    not_ball = known & ((sat > 88) | ((yel > 0.22) & (sat > 65)) | (val < 110))
+    drop |= not_ball
+    print(f"  {ch}: {not_ball[~mot].sum()} of {(~mot).sum()} detector hits and {not_ball[mot].sum()} of {mot.sum()} motion sightings rejected by colour")
     # 1) goal frames and nets: the net flutters and looks like a small moving object
     cam0 = cams[0][2]
     L, W = calib["pitch"]["L"], calib["pitch"]["W"]
@@ -84,14 +94,17 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
         tk = np.round(M / STEP).astype(np.int64)
         for dk in (-1, 0, 1):
             lo, hi = np.searchsorted(pk, tk + dk), np.searchsorted(pk, tk + dk + 1)
-            for i in np.flatnonzero(mot & ~drop & (hi > lo)):
+            for i in np.flatnonzero(mot & ~drop & ~near & (hi > lo)):
                 b = pb[lo[i]:hi[i]]
                 w, h = b[:, 2] - b[:, 0], b[:, 3] - b[:, 1]
                 x, y = PX[i]
                 if ((x > b[:, 0] - 0.35 * w - 4) & (x < b[:, 2] + 0.35 * w + 4) & (y > b[:, 1]) & (y < b[:, 3] + 0.12 * h + 4)).any():
                     near[i] = True
-    print(f"  {ch}: dropped {drop.sum()} of {n0} motion sightings (goal mouths, flicker); {(near & ~drop).sum()} more down-weighted next to players")
-    CF = np.where(near, CF * 0.35, CF)   # boots and limbs look like a ball; the real ball is often there too
+    # next to a player a moving boot looks like a ball: there a motion sighting must also pass the colour
+    # test and counts for less; without colour information it is not used at all
+    print(f"  {ch}: {(near & ~drop).sum()} motion sightings next to players kept at reduced weight")
+    drop |= near & ~known
+    CF = np.where(near, CF * 0.5, CF)
     M, PX, SZ, CF = M[~drop], PX[~drop], SZ[~drop], CF[~drop]
     # fixed false alarms: the same image cell firing again and again
     cell = (PX[:, 0] // 14).astype(int) * 1000 + (PX[:, 1] // 14).astype(int)
@@ -290,6 +303,50 @@ def solve_heights(k, nodes, lam=3.0, rounds=6, anchor=None, chunk=300):
     return xy, h
 
 
+def carry_with_players(K, XY, Z, tracks, max_gap=40):
+    """Fill gaps where the ball is hidden at someone's feet: if a player is on the ball when it
+    disappears, the ball goes with that player until it is seen again (blending into the next
+    sighting over the last half second). Other gaps are left as gaps."""
+    from scipy.spatial import cKDTree
+    T = np.load(tracks)
+    tk, txy = T["k"], T["xy"]
+    o = np.argsort(tk, kind="stable"); tk, txy = tk[o], txy[o]
+    lo_all = np.searchsorted(tk, np.arange(K.min(), K.max() + 2))
+    def players(k):
+        i = k - K.min()
+        return txy[lo_all[i]:lo_all[i + 1]] if 0 <= i < len(lo_all) - 1 else np.zeros((0, 2))
+    newK, newXY, newZ, carried = [K[:1]], [XY[:1]], [Z[:1]], [np.zeros(1, bool)]
+    filled = 0
+    for a in range(len(K) - 1):
+        ka, kb = K[a], K[a + 1]
+        if 1 < kb - ka <= max_gap:
+            P = players(ka)
+            d = np.linalg.norm(P - XY[a], axis=1) if len(P) else np.array([])
+            if len(d) and d.min() < 1.5:
+                pos = P[d.argmin()]
+                ks, ps = [], []
+                ok = True
+                for k in range(ka + 1, kb):
+                    Q = players(k)
+                    if not len(Q):
+                        ok = False; break
+                    dd = np.linalg.norm(Q - pos, axis=1)
+                    if dd.min() > 1.6:      # lost the player: give up rather than guess
+                        ok = False; break
+                    pos = Q[dd.argmin()]
+                    ks.append(k); ps.append(pos.copy())
+                if ok and ks and np.linalg.norm(ps[-1] - XY[a + 1]) < 3.0 + 0.5 * (kb - ka) * 0.2 * 8:
+                    ps = np.array(ps)
+                    nb = min(3, len(ks))                # blend into the next sighting
+                    w = np.linspace(0, 1, nb + 2)[1:-1]
+                    ps[-nb:] = ps[-nb:] * (1 - w[:, None]) + XY[a + 1] * w[:, None]
+                    newK.append(np.array(ks)); newXY.append(ps); newZ.append(np.full(len(ks), BALL_R)); carried.append(np.ones(len(ks), bool))
+                    filled += len(ks)
+        newK.append(K[a + 1:a + 2]); newXY.append(XY[a + 1:a + 2]); newZ.append(Z[a + 1:a + 2]); carried.append(np.zeros(1, bool))
+    print(f"carried with the player in possession on {filled} ticks ({filled / GRID_HZ / 60:.1f} min)")
+    return np.concatenate(newK), np.concatenate(newXY), np.concatenate(newZ), np.concatenate(carried)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--det", default="data/det")
@@ -362,7 +419,10 @@ def main():
         K.append(kk); Z.append(np.interp(kk * STEP, m[s:e], h[s:e]))
         XY.append(np.c_[np.interp(kk * STEP, m[s:e], xy[s:e, 0]), np.interp(kk * STEP, m[s:e], xy[s:e, 1])])
     K, XY, Z = np.concatenate(K), np.concatenate(XY), np.concatenate(Z)
-    np.savez_compressed(a.out, k=K, xy=XY, z=Z, m15=m, xy15=xy, z15=h, views15=nodes[:, 4].astype(int), w15=nodes[:, 3])
+    carried = np.zeros(len(K), bool)
+    if os.path.exists(a.tracks):
+        K, XY, Z, carried = carry_with_players(K, XY, Z, a.tracks)
+    np.savez_compressed(a.out, k=K, xy=XY, z=Z, carried=carried, m15=m, xy15=xy, z15=h, views15=nodes[:, 4].astype(int), w15=nodes[:, 3])
     span = m_hi - m_lo if m_hi - m_lo < 10**7 else (max(cand) - min(cand) + 1)
     print(f"path: {len(m)} sightings on {len(cand)} frames with candidates ({n0 - len(m)} dropped as spikes); "
           f"{(nodes[:, 4] == 2).mean() * 100:.0f}% triangulated, {(h > 0.5).mean() * 100:.0f}% airborne")
