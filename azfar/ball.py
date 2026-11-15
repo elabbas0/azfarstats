@@ -23,6 +23,8 @@ V_BALL = 28.0        # m/s, hardest plausible shot
 MAX_GAP = 30         # frames the ball may be unseen inside one path piece (2 s)
 TOP = 8              # candidates kept per frame
 H_MAX = 3.0          # highest the ball is assumed to fly, m
+USE_BALLDET = True    # use data/balldet_out (dedicated ball detector, every frame) when present
+BALLDET_W = 1.0
 STATIC_PX = 4         # px cell for the fixed-clutter test
 STATIC_SEC = 60       # seconds a spot must be active to count as fixed clutter
 SIZE_W = 6.0        # weight of the apparent-size height estimate in the height solve
@@ -54,6 +56,16 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
             EL.append(np.ones(sel.sum(), np.float32))
             pp_ = os.path.join(os.path.dirname(scan_dir.rstrip("/")) or ".", "ballpatch", name.replace(".npz", "_pdet.npy")) if scan_dir else ""
             PR.append(np.load(pp_) if pp_ and os.path.exists(pp_) else np.full(sel.sum(), np.nan, np.float32))
+        bd = os.path.join("data/balldet_out", name)
+        if USE_BALLDET and os.path.exists(bd):
+            d = np.load(bd)
+            b_ = d["box"]
+            M.append(np.round(c.t0 * FPS).astype(np.int64) + d["f"].astype(np.int64))
+            PX.append(np.c_[(b_[:, 0] + b_[:, 2]) / 2, (b_[:, 1] + b_[:, 3]) / 2])
+            SZ.append(np.maximum(b_[:, 2] - b_[:, 0], b_[:, 3] - b_[:, 1])); CF.append(np.clip(d["conf"], 0.0, 1.0) * BALLDET_W)
+            COL.append(np.full((len(d["f"]), 3), np.nan, np.float32)); EL.append(np.ones(len(d["f"]), np.float32))
+            PR.append(np.full(len(d["f"]), np.nan, np.float32))
+            continue          # with the dedicated detector, motion blobs are no longer needed for this clip
         p = os.path.join(scan_dir, name) if scan_dir else ""
         if p and os.path.exists(p):
             d = np.load(p)
