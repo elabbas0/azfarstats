@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse, json, os
 import numpy as np, cv2
 from .timeline import scan, GRID_HZ
-from .frames import grab
 
 HMS = lambda s: sum(int(p) * m for p, m in zip(s.split(":"), (3600, 60, 1)))
 TILE = 120
@@ -35,6 +34,35 @@ def pool(clip, scan_dir, det_dir, patch_dir, lo, hi):
     return out
 
 
+def crops_for_clip(path, items):
+    cv2.setNumThreads(1)
+    want = {}
+    for it in items:
+        want.setdefault(it[3], []).append(it)
+    cap = cv2.VideoCapture(path)
+    out, i, last = [], 0, max(want)
+    while i <= last:
+        if i in want:
+            ok, im = cap.read()
+            if not ok:
+                break
+            for name, kind, row, f, x, y, sz, pp in want[i]:
+                half = int(max(30, 4 * sz))
+                x0, y0 = int(x) - half, int(y) - half
+                crop = cv2.copyMakeBorder(im, half, half, half, half, cv2.BORDER_CONSTANT)[y0 + half:y0 + 3 * half, x0 + half:x0 + 3 * half]
+                crop = cv2.resize(crop, (TILE, TILE), interpolation=cv2.INTER_CUBIC)
+                c_, r_ = TILE // 2, int(max(9, sz / (2 * half) * TILE * 0.7))
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    p0 = (c_ + dx * (r_ + 3), c_ + dy * (r_ + 3)); p1 = (c_ + dx * (r_ + 11), c_ + dy * (r_ + 11))
+                    cv2.line(crop, p0, p1, (0, 0, 255), 2)
+                out.append((crop, dict(clip=name, kind=kind, row=row, frame=f, x=x, y=y, size=sz, p=pp)))
+        elif not cap.grab():
+            break
+        i += 1
+    cap.release()
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw", default="data/raw"); ap.add_argument("--det", default="data/det")
@@ -54,23 +82,17 @@ def main():
     rng = np.random.default_rng(a.seed)
     pick = rng.choice(len(P), a.n, replace=False, p=wt / wt.sum())
     pick = sorted(pick, key=lambda i: (P[i][0], P[i][3]))
-    tiles, meta, cache = {}, [], {}
+    # one sequential pass per clip (seeking HEVC frame by frame is far too slow), clips in parallel
+    from multiprocessing import Pool
+    jobs = {}
     for i in pick:
-        name, kind, row, f, x, y, sz, pp = P[i]
-        key = (name, f)
-        if key not in cache:
-            cache.clear(); cache[key] = grab(clips[name].path, f)
-        im = cache[key]
-        half = int(max(30, 4 * sz))
-        x0, y0 = int(x) - half, int(y) - half
-        crop = cv2.copyMakeBorder(im, half, half, half, half, cv2.BORDER_CONSTANT)[y0 + half:y0 + 3 * half, x0 + half:x0 + 3 * half]
-        crop = cv2.resize(crop, (TILE, TILE), interpolation=cv2.INTER_CUBIC)
-        c_, r_ = TILE // 2, int(max(9, sz / (2 * half) * TILE * 0.7))
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            p0 = (c_ + dx * (r_ + 3), c_ + dy * (r_ + 3)); p1 = (c_ + dx * (r_ + 11), c_ + dy * (r_ + 11))
-            cv2.line(crop, p0, p1, (0, 0, 255), 2)
-        tiles[len(meta)] = crop
-        meta.append(dict(clip=name, kind=kind, row=row, frame=f, x=x, y=y, size=sz, p=pp))
+        jobs.setdefault(P[i][0], []).append(P[i])
+    with Pool(4) as pool_:
+        res = pool_.starmap(crops_for_clip, [(clips[n].path, v) for n, v in jobs.items()])
+    tiles, meta = [], []
+    for part in res:
+        for crop, md in part:
+            tiles.append(crop); meta.append(md)
     order = rng.permutation(len(meta))                    # shuffle so neighbours are unrelated
     meta = [meta[i] for i in order]; tiles = [tiles[i] for i in order]
     os.makedirs(a.out, exist_ok=True)
