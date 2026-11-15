@@ -29,7 +29,7 @@ W_MOTION = 0.12      # weight of a motion blob relative to detector confidence
 def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     """All sightings of one camera as sight lines. Time index m = frames at 15 per second since midnight."""
     cams = aim_cameras(calib, ch)
-    M, PX, SZ, CF, COL = [], [], [], [], []
+    M, PX, SZ, CF, COL, EL = [], [], [], [], [], []
     PK, PB = [], []
     for c in clips:
         if c.ch != ch:
@@ -47,10 +47,12 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
             ps = os.path.join(scan_dir, name) if scan_dir else ""
             dc = np.load(ps)["det_col"] if ps and os.path.exists(ps) and "det_col" in np.load(ps).files else None
             COL.append(dc[sel] if dc is not None else np.full((sel.sum(), 3), np.nan, np.float32))
+            EL.append(np.ones(sel.sum(), np.float32))
         p = os.path.join(scan_dir, name) if scan_dir else ""
         if p and os.path.exists(p):
             d = np.load(p)
             COL.append(d["col"] if "col" in d.files else np.full((len(d["f"]), 3), np.nan, np.float32))
+            EL.append(d["elong"] if "elong" in d.files else np.ones(len(d["f"]), np.float32))
             M.append(np.round(c.t0 * FPS).astype(np.int64) + d["f"].astype(np.int64)); PX.append(d["xy"].astype(np.float64))
             SZ.append(d["size"]); CF.append(-(d["bright"] / 255.0))      # negative marks a motion blob (brightness kept)
     det_boxes = None
@@ -58,16 +60,17 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
         pk, pb = np.concatenate(PK), np.concatenate(PB)
         o = np.argsort(pk, kind="stable")
         det_boxes = (pk[o], pb[o])
-    M, PX, SZ, CF, COL = (np.concatenate(x) for x in (M, PX, SZ, CF, COL))
+    M, PX, SZ, CF, COL, EL = (np.concatenate(x) for x in (M, PX, SZ, CF, COL, EL))
     keep = (M >= m_lo) & (M < m_hi)
-    M, PX, SZ, CF, COL = M[keep], PX[keep], SZ[keep], CF[keep], COL[keep]
+    M, PX, SZ, CF, COL, EL = M[keep], PX[keep], SZ[keep], CF[keep], COL[keep], EL[keep]
     mot = CF < 0
     n0 = mot.sum()
     drop = np.zeros(len(M), bool)
     # 0) colour: the match ball is white/cream. Neon boots, coloured socks and dark shoes are not.
     sat, val, yel = COL[:, 0], COL[:, 1], COL[:, 2]
     known = ~np.isnan(sat) & (val > 0)
-    not_ball = known & ((sat > 88) | ((yel > 0.22) & (sat > 65)) | (val < 110))
+    streak = EL > 1.8          # a fast ball blurs into the grass: more colour, less brightness
+    not_ball = known & ((sat > np.where(streak, 115, 88)) | ((yel > 0.22) & (sat > 65)) | (val < np.where(streak, 95, 110)))
     drop |= not_ball
     print(f"  {ch}: {not_ball[~mot].sum()} of {(~mot).sum()} detector hits and {not_ball[mot].sum()} of {mot.sum()} motion sightings rejected by colour")
     # 1) goal frames and nets: the net flutters and looks like a small moving object
@@ -140,9 +143,30 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     cell = (PX[:, 0] // 12).astype(np.int64) * 1000 + (PX[:, 1] // 12).astype(np.int64)
     u, inv, cnt = np.unique(cell, return_inverse=True, return_counts=True)
     good &= ~(off & (cnt[inv] > 30))
+    # a ball the detector finds INSIDE a player's outline, above the feet, is in their hands (keeper,
+    # throw-in) or against their body: its height is roughly where it sits in that outline
+    hfix = np.full(len(M), np.nan)
+    if det_boxes is not None:
+        pk, pb = det_boxes
+        tk = np.round(M / STEP).astype(np.int64)
+        lo_, hi_ = np.searchsorted(pk, tk), np.searchsorted(pk, tk + 1)
+        for i in np.flatnonzero((CF >= 0) & good & (hi_ > lo_)):
+            b = pb[lo_[i]:hi_[i]]
+            x, y = PX[i]
+            bh = b[:, 3] - b[:, 1]
+            inside = (x > b[:, 0]) & (x < b[:, 2]) & (y > b[:, 1] + 0.08 * bh) & (y < b[:, 3] - 0.18 * bh)
+            if inside.any():
+                j = int(np.argmax(inside))
+                # on the ground it would sit at the player's feet; held up high, its ground reading lands
+                # metres behind them. Only the second case is a held ball.
+                cam_ = cams[ci[i]][2]
+                foot, okf = cam_.to_ground(np.array([[(b[j, 0] + b[j, 2]) / 2, b[j, 3]]]))
+                if okf[0] and np.linalg.norm(G[i] - foot[0]) > 1.5:
+                    hfix[i] = float(np.clip(1.75 * (b[j, 3] - y) / bh[j], 0.3, 2.3))
+    print(f"  {ch}: {np.isfinite(hfix).sum()} detector sightings of the ball held or against a body")
     w = np.where(CF >= 0, CF, W_MOTION * (0.5 + 0.5 * -CF) * np.exp(-0.5 * np.log(np.maximum(ratio, 0.2) / 1.2) ** 2))
     w = w * np.where(rng < 24, 1.0, 0.6)                    # trust a camera most in its own half
-    return dict(m=M[good], w=w[good], det=(CF >= 0)[good], O=O[good], D=D[good], g=G[good])
+    return dict(m=M[good], w=w[good], det=(CF >= 0)[good], O=O[good], D=D[good], g=G[good], hfix=hfix[good])
 
 
 def triangulate_all(Oa, Da, Ob, Db):
@@ -192,6 +216,10 @@ def candidates(A, B, pitch):
                 p0, p1 = A_ + Bv * BALL_R, A_ + Bv * H_MAX
                 if not ((-3 < p0[0] < L + 3 and -3 < p0[1] < W + 3) or (-3 < p1[0] < L + 3 and -3 < p1[1] < W + 3)):
                     continue
+                if np.isfinite(V["hfix"][i]):   # held: fixed point at that height on the sight line
+                    p = A_ + Bv * V["hfix"][i]
+                    rows.append((p[0], p[1], V["hfix"][i], V["w"][i] + 0.2, 3, p[0], p[1], 0.0, 0.0))
+                    continue
                 rows.append((V["g"][i, 0], V["g"][i, 1], np.nan, V["w"][i], 1, *A_, *Bv))
         if rows:
             rows.sort(key=lambda r: -r[3])
@@ -233,6 +261,15 @@ def best_path(cand):
             reach = 0.3 + V_BALL * g
             gd = np.linalg.norm(P0[lo:hi] - P0[a], axis=1)          # same move if the ball stayed on the ground
             cost = 0.5 * dist + 0.5 * np.minimum(gd, dist + 3.0)    # leaving the ground must be earned
+            # a ball keeps going: what matters is how far it strays from where its last velocity
+            # would take it, not how fast it goes (otherwise hard shots lose to slow false sightings)
+            pj = prev[lo:hi]
+            has = pj >= 0
+            pjc = np.maximum(pj, 0)
+            gp = (tick[lo:hi] - tick[pjc]) * DT
+            vj = (P0[lo:hi] - P0[pjc]) / np.maximum(gp, DT)[:, None]
+            dev = np.linalg.norm(P0[lo:hi] + vj * g[:, None] - P0[a], axis=1)
+            cost = np.where(has & (gp <= 6 * DT), np.minimum(dev, cost), cost)
             s = score[lo:hi] - 0.02 * cost / g - 0.02 * (g / DT - 1)  # slower hops and shorter gaps preferred
             s = np.where(dist <= reach, s, -1e18)
             j = int(np.argmax(s))
@@ -256,7 +293,7 @@ def solve_heights(k, nodes, lam=3.0, rounds=6, anchor=None, chunk=300):
     from scipy.optimize import lsq_linear
     from scipy.sparse import csr_matrix
     xy = nodes[:, :2].copy()
-    h = np.where(nodes[:, 4] == 2, nodes[:, 2], BALL_R)
+    h = np.where(nodes[:, 4] >= 2, nodes[:, 2], BALL_R)
     A, Bv = nodes[:, 5:7], nodes[:, 7:9]
     free_all = nodes[:, 4] == 1
     cuts = np.flatnonzero(np.diff(k) > MAX_GAP) + 1
@@ -381,7 +418,8 @@ def main():
         st = np.diff(xy, axis=0)
         near = (np.diff(m)[:-1] <= MAX_GAP) & (np.diff(m)[1:] <= MAX_GAP)
         la, lb = np.linalg.norm(st[:-1], axis=1), np.linalg.norm(st[1:], axis=1)
-        spike = near & ((st[:-1] * st[1:]).sum(1) < -0.5 * la * lb) & (np.minimum(la, lb) > 1.5)
+        back = np.linalg.norm(xy[2:] - xy[:-2], axis=1) < 0.6 * np.minimum(la, lb)   # returns to where it was:
+        spike = near & back & ((st[:-1] * st[1:]).sum(1) < -0.5 * la * lb) & (np.minimum(la, lb) > 1.5)  # not a rebound
         if not spike.any():
             break
         keep = np.ones(len(m), bool); keep[1:-1] = ~spike

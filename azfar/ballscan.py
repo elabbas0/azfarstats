@@ -47,21 +47,23 @@ def blobs(small, fg, exp):
     for i in range(1, n):
         x, y, w, h, a = st[i]
         m = max(w, h)
-        if a < 3 or m > 40 or m / max(min(w, h), 1) > 3.5 or a / (w * h) < 0.4:
+        elong = m / max(min(w, h), 1)
+        if a < 3 or m > 70 or elong > 7 or a / (w * h) < 0.3:
             continue
+        sz = min(w, h) if elong > 1.8 else m   # a fast ball smears into a streak as wide as the ball
         cx, cy = cen[i]
         e = exp[min(int(cy), exp.shape[0] - 1), min(int(cx), exp.shape[1] - 1)]
-        ratio = m / e if e > 0 else 0.0
+        ratio = sz / e if e > 0 else 0.0
         if e > 0 and not (0.5 < ratio < 4.5):
             continue
-        if e == 0 and not (2 <= m <= 16):
+        if e == 0 and not (2 <= sz <= 16):
             continue
         patch = small[y:y + h, x:x + w]
         bright = float(patch.max(2).mean())
         # prefer ball-sized, bright blobs
         score = bright / 255.0 - 0.25 * abs(np.log(max(ratio, 0.3) / 1.3))
         sat, val, yel = colour(small, cx, cy, 0.35 * min(w, h) + 0.5)
-        out.append((score, cx / S, cy / S, m / S, bright, a, sat, val, yel))
+        out.append((score, cx / S, cy / S, sz / S, bright, a, sat, val, yel, elong))
     out.sort(reverse=True)
     return out[:TOP]
 
@@ -74,7 +76,7 @@ def run_clip(clip, cam, det_path, out_path):
     exp = expected_size_map(cam)
     mog = cv2.createBackgroundSubtractorMOG2(history=900, varThreshold=36, detectShadows=False)
     cap = cv2.VideoCapture(clip.path)
-    F, XY, SZ, BR, AR, COL = [], [], [], [], [], []
+    F, XY, SZ, BR, AR, COL, EL = [], [], [], [], [], [], []
     db = np.flatnonzero(d["cls"] == 32)                       # detector ball hits: colour them too
     det_at = {}
     fm = dict(clip.grid_frames())
@@ -98,17 +100,17 @@ def run_clip(clip, cam, det_path, out_path):
             if hi == lo:  # no boxes on this exact tick: use the previous one
                 lo, hi = np.searchsorted(pk, [k - 1, k])
             for x1, y1, x2, y2 in pb[lo:hi]:
-                gw = (x2 - x1) * 0.12 + 2
+                gw = 2   # just the player; colour checks downstream deal with boots next to them
                 fg[max(int(y1 - 3), 0):int(y2 + 3), max(int(x1 - gw), 0):int(x2 + gw)] = 0
-            for s_, x, y, m, br, a, sat, val, yel in blobs(small, fg, exp):
-                F.append(i); XY.append((x, y)); SZ.append(m); BR.append(br); AR.append(a); COL.append((sat, val, yel))
+            for s_, x, y, m, br, a, sat, val, yel, el in blobs(small, fg, exp):
+                F.append(i); XY.append((x, y)); SZ.append(m); BR.append(br); AR.append(a); COL.append((sat, val, yel)); EL.append(el)
         i += 1
         if i % 9000 == 0:
             print(f"{os.path.basename(clip.path)} {i}/{clip.n_frames} {i / (time.time() - t0):.0f} fps", flush=True)
     cap.release()
     np.savez_compressed(out_path, f=np.array(F, np.int32), xy=np.array(XY, np.float32).reshape(-1, 2),
                         size=np.array(SZ, np.float32), bright=np.array(BR, np.float32), area=np.array(AR, np.int32),
-                        col=np.array(COL, np.float32).reshape(-1, 3), det_col=DCOL)
+                        col=np.array(COL, np.float32).reshape(-1, 3), det_col=DCOL, elong=np.array(EL, np.float32))
 
 
 def main():
