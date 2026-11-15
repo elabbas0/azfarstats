@@ -75,6 +75,8 @@ def main():
     ap.add_argument("--session", default="config/session.json")
     ap.add_argument("--model", default="data/models/ballclf.pt")
     ap.add_argument("--epochs", type=int, default=6)
+    ap.add_argument("--labels", default="data/labels/labelled_s3.json", help="hand-checked candidates (azfar.labelsheet)")
+    ap.add_argument("--label-weight", type=float, default=25.0)
     a = ap.parse_args()
     torch.set_num_threads(4); torch.manual_seed(0)
     m = json.load(open(a.session))["matches"][0]
@@ -97,10 +99,27 @@ def main():
             Xtr.append(X[tr]); Ytr.append(np.full(tr.sum(), y)); Xva.append(X[~tr]); Yva.append(np.full((~tr).sum(), y))
         print(f"{L['name']}: {len(L['pos_det'])} ball (detector) + {len(L['pos_blob'])} ball (motion), {len(neg)} not-ball", flush=True)
     Xtr, Ytr, Xva, Yva = np.concatenate(Xtr), np.concatenate(Ytr), np.concatenate(Xva), np.concatenate(Yva)
+    Wtr = np.ones(len(Ytr), np.float32)
+    # hand-checked candidates: 2/3 join training with a high weight, 1/3 is kept apart to measure on
+    Xh_tr, Yh_tr, Xh_te, Yh_te = [], [], [], []
+    if os.path.exists(a.labels):
+        H = [h for h in json.load(open(a.labels)) if h["label"] in ("0", "1")]
+        cache = {}
+        for n_, h in enumerate(H):
+            key = (h["clip"], h["kind"])
+            if key not in cache:
+                cache[key] = np.load(os.path.join(a.patch, f"{h['clip']}_{h['kind']}.npy"), mmap_mode="r")
+            x = np.asarray(cache[key][h["row"]]); y = int(h["label"])
+            (Xh_te if n_ % 3 == 0 else Xh_tr).append(x); (Yh_te if n_ % 3 == 0 else Yh_tr).append(y)
+        if Xh_tr:
+            Xtr = np.concatenate([Xtr, np.stack(Xh_tr)]); Ytr = np.concatenate([Ytr, Yh_tr])
+            Wtr = np.concatenate([Wtr, np.full(len(Yh_tr), a.label_weight, np.float32)])
+        print(f"hand-checked: {len(Yh_tr)} for training ({sum(Yh_tr)} balls), {len(Yh_te)} held out ({sum(Yh_te)} balls)")
+    Xh_te = np.stack(Xh_te) if Xh_te else None; Yh_te = np.array(Yh_te)
     print(f"train {len(Ytr)} ({Ytr.mean() * 100:.0f}% ball), check {len(Yva)} ({Yva.mean() * 100:.0f}% ball)")
     net = Net(); opt = torch.optim.AdamW(net.parameters(), 2e-3, weight_decay=1e-4)
     pw = torch.tensor((1 - Ytr.mean()) / Ytr.mean())
-    lossf = nn.BCEWithLogitsLoss(pos_weight=pw)
+    lossf = nn.BCEWithLogitsLoss(pos_weight=pw, reduction="none")
     for ep in range(a.epochs):
         net.train(); perm = rng.permutation(len(Ytr)); tot = 0
         for s0 in range(0, len(perm), 256):
@@ -109,13 +128,19 @@ def main():
             if rng.random() < 0.5:
                 x = x.flip(3)
             x = x * float(rng.uniform(0.8, 1.2)) + float(rng.uniform(-0.08, 0.08))
-            loss = lossf(net(x), torch.from_numpy(Ytr[b]).float())
+            loss = (lossf(net(x), torch.from_numpy(Ytr[b]).float()) * torch.from_numpy(Wtr[b])).sum() / float(Wtr[b].sum())
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item() * len(b)
         net.eval()
         with torch.no_grad():
             pv = torch.cat([torch.sigmoid(net(prep(Xva[i:i + 2048]))) for i in range(0, len(Yva), 2048)]).numpy()
         order = np.argsort(-pv); tp = np.cumsum(Yva[order]); auc = (np.argsort(np.argsort(pv))[Yva == 1].sum() - Yva.sum() * (Yva.sum() - 1) / 2) / (Yva.sum() * (len(Yva) - Yva.sum()))
         rec = ((pv > 0.5) & (Yva == 1)).sum() / Yva.sum(); prec = ((pv > 0.5) & (Yva == 1)).sum() / max((pv > 0.5).sum(), 1)
+        if Xh_te is not None:
+            with torch.no_grad():
+                ph = torch.sigmoid(net(prep(Xh_te))).numpy()
+            for th in (0.5, 0.8):
+                tp = ((ph >= th) & (Yh_te == 1)).sum(); fp = ((ph >= th) & (Yh_te == 0)).sum()
+                print(f"   held-out hand-checked at {th}: finds {tp}/{(Yh_te == 1).sum()} balls, lets through {fp}/{(Yh_te == 0).sum()} non-balls", flush=True)
         print(f"epoch {ep}: loss {tot / len(Ytr):.3f}; later-match check: AUC {auc:.3f}, at 0.5 finds {rec * 100:.0f}% of balls, {prec * 100:.0f}% of its 'ball' calls are right", flush=True)
     torch.save(net.state_dict(), a.model)
     with torch.no_grad():

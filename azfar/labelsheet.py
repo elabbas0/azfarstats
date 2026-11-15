@@ -17,7 +17,7 @@ TILE = 120
 
 def pool(clip, scan_dir, det_dir, patch_dir, lo, hi):
     name = os.path.basename(clip.path).replace(".mp4", "")
-    s = np.load(os.path.join(scan_dir, name + ".npz")); d = np.load(os.path.join(det_dir, name + ".npz"))
+    s = dict(np.load(os.path.join(scan_dir, name + ".npz"))); d = dict(np.load(os.path.join(det_dir, name + ".npz")))   # read each array once
     pb = np.load(os.path.join(patch_dir, name + "_pblob.npy")); pd = np.load(os.path.join(patch_dir, name + "_pdet.npy"))
     sel = np.flatnonzero(d["cls"] == 32)
     fm = dict(clip.grid_frames())
