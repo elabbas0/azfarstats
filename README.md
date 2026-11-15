@@ -25,6 +25,12 @@ Put the XVR files (`XVR_ch<N>_main_<start>_<end>.mp4`) in `data/raw/`, then:
 `python -m azfar.sheet` writes a contact sheet (a row of crops per player) for checking identities
 and putting names to numbers. Names, team overrides and match windows go in `config/session.json`.
 
+## Experiments kept for reference
+
+`azfar.possession` (who has the ball, straight passes between players) and `azfar.ballfuse` (combine it with the
+sighting track) remove all hopping but did not place the ball correctly more often on a random-moment check
+(18 of 36 for both, vs 18 of 26 shown for the sighting track alone), so the replay uses the sighting track.
+
 ## What to trust
 
 - Positions, distance and speed are measured; the two cameras agree to about 0.4 m.
