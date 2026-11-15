@@ -78,7 +78,8 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     not_ball = known & ((sat > np.where(streak, 115, 88)) | ((yel > 0.22) & (sat > 65)) | (val < np.where(streak, 95, 110)))
     scored = np.isfinite(PR)
     # where the learnt recogniser has scored a candidate, it decides (it has seen this ball and these boots)
-    not_ball = np.where(scored, np.where(CF < 0, PR < 0.3, (PR < 0.1) & (CF < 0.5)), not_ball)
+    yellow = known & (yel > 0.22) & (sat > 65)    # neon boots fool everything else: always out
+    not_ball = np.where(scored, np.where(CF < 0, PR < 0.6, (PR < 0.15) & (CF < 0.5)), not_ball) | yellow
     known = known | scored
     drop |= not_ball
     print(f"  {ch}: {not_ball[~mot].sum()} of {(~mot).sum()} detector hits and {not_ball[mot].sum()} of {mot.sum()} motion sightings rejected by colour")
@@ -159,7 +160,8 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
         pk, pb = det_boxes
         tk = np.round(M / STEP).astype(np.int64)
         lo_, hi_ = np.searchsorted(pk, tk), np.searchsorted(pk, tk + 1)
-        for i in np.flatnonzero((CF >= 0) & good & (hi_ > lo_)):
+        sure = (CF >= 0.6) & (np.nan_to_num(PR, nan=0.0) >= 0.85)   # shirts, knees and boots in front of a body fool weaker hits
+        for i in np.flatnonzero(sure & good & (hi_ > lo_)):
             b = pb[lo_[i]:hi_[i]]
             x, y = PX[i]
             bh = b[:, 3] - b[:, 1]
@@ -176,7 +178,7 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     w = np.where(CF >= 0, CF, W_MOTION * (0.5 + 0.5 * -CF) * np.exp(-0.5 * np.log(np.maximum(ratio, 0.2) / 1.2) ** 2))
     # recogniser score, where available: motion blobs it is sure of count almost like a detector hit
     sizefit = np.exp(-0.5 * np.log(np.maximum(ratio, 0.2) / 1.2) ** 2)
-    w = np.where(np.isfinite(PR), np.where(CF >= 0, CF * (0.4 + 0.6 * np.nan_to_num(PR)), 0.35 * np.nan_to_num(PR) * sizefit), w)
+    w = np.where(np.isfinite(PR), np.where(CF >= 0, CF * (0.4 + 0.6 * np.nan_to_num(PR)), 0.25 * np.nan_to_num(PR) * sizefit), w)
     w = w * np.where(rng < 24, 1.0, 0.6)                    # trust a camera most in its own half
     return dict(m=M[good], w=w[good], det=(CF >= 0)[good], O=O[good], D=D[good], g=G[good], hfix=hfix[good])
 
