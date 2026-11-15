@@ -16,7 +16,8 @@ Put the XVR files (`XVR_ch<N>_main_<start>_<end>.mp4`) in `data/raw/`, then:
 | 5 | `python -m azfar.embed` | Appearance embeddings (OSNet) for each player once per second. |
 | 6 | `python -m azfar.fuse` | Merges both views on the pitch plane into tracklets; drops people off the pitch. |
 | 6b | `python -m azfar.balldata`, train (`data/models/train_balldet.py`), `python -m azfar.balldet` | Dedicated ball detector trained on this pitch from trusted sightings; run on every frame (15/s). About 2.5 h training and 2 h inference on 4 CPU cores. |
-| 7 | `python -m azfar.ballscan` then `python -m azfar.ball` | Motion blobs on every frame, then the single most plausible ball path from detector hits and blobs (triangulated when both cameras see it, height solved along the sight line otherwise). |
+| 7a | `python -m azfar.balltrack` | **Current ball tracker** on the dedicated detector: shows the ball only when confirmed (3 consistent sightings), stays locked on it, hides it when lost or when one camera sees it in the air. |
+| 7 | (older) `python -m azfar.ballscan` then `python -m azfar.ball` | Motion blobs on every frame, then the single most plausible ball path from detector hits and blobs (triangulated when both cameras see it, height solved along the sight line otherwise). |
 | 7b | `python -m azfar.window --write` | Finds the match window: skips the warm-up (several balls on the pitch at once) and stops where the first camera stops. |
 | 8 | `python -m azfar.identify --start HH:MM:SS --end HH:MM:SS` | Assigns tracklets to a fixed roster of players. |
 | 9 | `python -m azfar.stats` / `python -m azfar.events` | Minutes, distance, speeds, sprints / touches, passes, shots, goals, assists, saves, dribbles. |

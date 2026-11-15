@@ -16,7 +16,7 @@ DT = 1.0 / GRID_HZ
 CONTROL_R = 1.6        # m: ball this close to a player's feet is "theirs"
 GOAL_W = 3.0           # goal width, m
 SHOT_V = 7.5           # m/s: slower than this towards goal is a pass/roll, not a shot
-BALL_GAP = 8           # ticks of missing ball bridged by interpolation
+BALL_GAP = 2           # ticks of missing ball bridged (0.4 s): if the ball is not found, it is not shown
 
 
 def grid_tracks(I, k0, k1, max_gap=15):
