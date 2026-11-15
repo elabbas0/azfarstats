@@ -23,6 +23,7 @@ V_BALL = 28.0        # m/s, hardest plausible shot
 MAX_GAP = 30         # frames the ball may be unseen inside one path piece (2 s)
 TOP = 8              # candidates kept per frame
 H_MAX = 3.0          # highest the ball is assumed to fly, m
+SIZE_W = 6.0        # weight of the apparent-size height estimate in the height solve
 NODE_COST = 0.05     # small: faint but consistent sightings (ball in traffic, fast shots) must still win over skipping
 W_MOTION = 0.12      # weight of a motion blob relative to detector confidence
 
@@ -153,6 +154,30 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     cell = (PX[:, 0] // 12).astype(np.int64) * 1000 + (PX[:, 1] // 12).astype(np.int64)
     u, inv, cnt = np.unique(cell, return_inverse=True, return_counts=True)
     good &= ~(off & (cnt[inv] > 30))
+    # too close to the lens: anything within 2 m of the camera is huge, blurred and not usable
+    good &= rng > 2.0
+    # parked balls: spare balls lying still (in a corner, against the boards) while play goes on. A spot
+    # that holds a ball-like object for 20+ seconds of a minute is not the match ball, except the centre
+    # spot, where the match ball waits before every kick-off.
+    centre = np.hypot(G[:, 0] - L_ / 2, G[:, 1] - W_ / 2) < 1.5
+    parked = np.zeros(len(M), bool)
+    sec = M // int(FPS)
+    for off_ in (0.0, 0.3):
+        cx_ = np.floor((G[:, 0] + off_) / 0.6).astype(np.int64); cy_ = np.floor((G[:, 1] + off_) / 0.6).astype(np.int64)
+        for woff in (0, 30):
+            win = (sec + woff) // 60
+            key = (cx_ + 1000) * 10**9 + (cy_ + 1000) * 10**4 + win
+            o = np.argsort(key, kind="stable")
+            ks, ss = key[o], sec[o]
+            # distinct seconds per (cell, minute)
+            first = np.r_[True, (ks[1:] != ks[:-1]) | (ss[1:] != ss[:-1])]
+            u, inv_, cnt_ = np.unique(ks[first], return_inverse=True, return_counts=True)
+            big = set(u[cnt_ >= 20].tolist())
+            if big:
+                parked |= np.isin(key, list(big))
+    parked &= ~centre
+    print(f"  {ch}: {(parked & good).sum()} sightings of parked balls ignored")
+    good &= ~parked
     # a ball the detector finds INSIDE a player's outline, above the feet, is in their hands (keeper,
     # throw-in) or against their body: its height is roughly where it sits in that outline
     hfix = np.full(len(M), np.nan)
@@ -180,7 +205,10 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     sizefit = np.exp(-0.5 * np.log(np.maximum(ratio, 0.2) / 1.2) ** 2)
     w = np.where(np.isfinite(PR), np.where(CF >= 0, CF * (0.4 + 0.6 * np.nan_to_num(PR)), 0.25 * np.nan_to_num(PR) * sizefit), w)
     w = w * np.where(rng < 24, 1.0, 0.6)                    # trust a camera most in its own half
-    return dict(m=M[good], w=w[good], det=(CF >= 0)[good], O=O[good], D=D[good], g=G[good], hfix=hfix[good])
+    # apparent size says how far along the sight line the ball is: a ball close to the lens looks big
+    r_obs = rng / np.maximum(ratio, 0.2)
+    hsize = np.clip(-O[:, 2] - r_obs * np.abs(D[:, 2]), 0.0, H_MAX)
+    return dict(m=M[good], w=w[good], det=(CF >= 0)[good], O=O[good], D=D[good], g=G[good], hfix=hfix[good], hsize=hsize[good])
 
 
 def triangulate_all(Oa, Da, Ob, Db):
@@ -218,7 +246,7 @@ def candidates(A, B, pitch):
                 wa, wb = A["w"][ia[i]], B["w"][ib[j]]
                 # two motion blobs agreeing is weak evidence; a detector hit on either side is strong
                 bonus = 0.3 if (A["det"][ia[i]] or B["det"][ib[j]]) else 0.08
-                rows.append((P[i, j, 0], P[i, j, 1], max(h[i, j], BALL_R), wa + wb + bonus, 2, P[i, j, 0], P[i, j, 1], 0.0, 0.0))
+                rows.append((P[i, j, 0], P[i, j, 1], max(h[i, j], BALL_R), wa + wb + bonus, 2, P[i, j, 0], P[i, j, 1], 0.0, 0.0, np.nan, 0.0))
                 used_a[i] = used_b[j] = True
         for V, idx, used in ((A, ia, used_a), (B, ib, used_b)):
             for i, u in zip(idx, used):
@@ -232,13 +260,20 @@ def candidates(A, B, pitch):
                     continue
                 if np.isfinite(V["hfix"][i]):   # held: fixed point at that height on the sight line
                     p = A_ + Bv * V["hfix"][i]
-                    rows.append((p[0], p[1], V["hfix"][i], V["w"][i] + 0.2, 3, p[0], p[1], 0.0, 0.0))
+                    rows.append((p[0], p[1], V["hfix"][i], V["w"][i] + 0.2, 3, p[0], p[1], 0.0, 0.0, np.nan, 0.0))
                     continue
-                rows.append((V["g"][i, 0], V["g"][i, 1], np.nan, V["w"][i], 1, *A_, *Bv))
+                rows.append((V["g"][i, 0], V["g"][i, 1], np.nan, V["w"][i], 1, *A_, *Bv, V["hsize"][i], 1.0 if V["det"][i] else 0.4))
         if rows:
             rows.sort(key=lambda r: -r[3])
             out[int(m)] = np.array(rows[:TOP])
     return out
+
+
+def node_hmax(nodes):
+    """Highest the ball may be placed along a single-camera sight line. Close to the camera that saw it,
+    a raised placement would be a legs-and-socks-at-the-lens mistake far more often than a real lob."""
+    near_cam = np.linalg.norm(nodes[:, 7:9], axis=1) * 2.3 < 6.0
+    return np.where((nodes[:, 4] == 1) & near_cam, 0.5, H_MAX)
 
 
 def seg_dist(a, b, p):
@@ -254,7 +289,7 @@ def best_path(cand):
     tick = np.concatenate([np.full(len(cand[m]), m) for m in ms])
     n = len(nodes)
     P0 = nodes[:, 5:7] + nodes[:, 7:9] * BALL_R      # sight line at ground level ...
-    P1 = nodes[:, 5:7] + nodes[:, 7:9] * H_MAX       # ... and at the highest plausible flight
+    P1 = nodes[:, 5:7] + nodes[:, 7:9] * node_hmax(nodes)[:, None]   # ... and at the highest plausible flight
     score = np.full(n, -1e18); prev = np.full(n, -1)
     run_best, run_arg, older = -1e18, -1, 0          # best node older than MAX_GAP (the path may restart from it)
     RESTART = 1.5
@@ -310,6 +345,7 @@ def solve_heights(k, nodes, lam=3.0, rounds=6, anchor=None, chunk=300):
     h = np.where(nodes[:, 4] >= 2, nodes[:, 2], BALL_R)
     A, Bv = nodes[:, 5:7], nodes[:, 7:9]
     free_all = nodes[:, 4] == 1
+    hmax_all = node_hmax(nodes)
     cuts = np.flatnonzero(np.diff(k) > MAX_GAP) + 1
     pieces = []
     for s, e in zip(np.r_[0, cuts], np.r_[cuts, len(k)]):
@@ -342,9 +378,16 @@ def solve_heights(k, nodes, lam=3.0, rounds=6, anchor=None, chunk=300):
             if anchor is not None:
                 pw = pw * np.where(anchor[s:e][free], 10.0, 1.0)
             R.append(base + np.arange(len(free))); Cc.append(np.arange(len(free))); V.append(pw)
-            y[base:] = pw * BALL_R
+            y[base:base + len(free)] = pw * BALL_R
+            # apparent-size height, where measured (about 0.6 m uncertain)
+            hs, hw = nodes[s:e, 9][free], nodes[s:e, 10][free]
+            okz = np.isfinite(hs) & (hw > 0)
+            nz = int(okz.sum())
+            if nz:
+                R.append(base + len(free) + np.arange(nz)); Cc.append(np.flatnonzero(okz)); V.append(SIZE_W * hw[okz])
+                y = np.r_[y, SIZE_W * hw[okz] * hs[okz]]
             M = csr_matrix((np.concatenate(V), (np.concatenate(R), np.concatenate(Cc))), shape=(len(y), len(free)))
-            hh[free] = lsq_linear(M, y, bounds=(BALL_R, H_MAX), lsq_solver='lsmr', tol=1e-6).x
+            hh[free] = lsq_linear(M, y, bounds=(np.full(len(free), BALL_R), hmax_all[s:e][free] + 1e-6), lsq_solver='lsmr', tol=1e-6).x
             P = np.where(free_all[s:e, None], A[s:e] + Bv[s:e] * hh[:, None], xy[s:e])
             v = np.diff(P, axis=0) / np.diff(t)[:, None]
             dv = np.linalg.norm(np.diff(v, axis=0), axis=1)
@@ -451,6 +494,47 @@ def main():
     # anything still too fast is a hand-over between two different objects: cut the path there
     sp = np.linalg.norm(np.diff(xy, axis=0), axis=1) / np.maximum(np.diff(m) * DT, DT)
     breaks = np.flatnonzero(sp > V_BALL) + 1
+    # excursions: a short burst (under half a second) that jumps away from the path and the path then
+    # carries on from where it was. That burst was another object (a boot, a spare ball): drop it.
+    for _ in range(3):
+        cuts_ = np.union1d(np.flatnonzero(np.diff(m) > MAX_GAP) + 1, breaks)
+        st_, en_ = np.r_[0, cuts_], np.r_[cuts_, len(m)]
+        keep = np.ones(len(m), bool)
+        for p_ in range(1, len(st_) - 1):
+            a0, a1 = st_[p_], en_[p_]
+            if (m[a1 - 1] - m[a0]) >= 8 or not keep[st_[p_ - 1]]:
+                continue
+            prev_end, next_start = en_[p_ - 1] - 1, st_[p_ + 1]
+            gap = (m[next_start] - m[prev_end]) * DT
+            if gap <= MAX_GAP * DT and np.linalg.norm(xy[next_start] - xy[prev_end]) <= 0.5 + V_BALL * gap:
+                keep[a0:a1] = False
+        if keep.all():
+            break
+        m, nodes, xy, h = m[keep], nodes[keep], xy[keep], h[keep]
+        sp = np.linalg.norm(np.diff(xy, axis=0), axis=1) / np.maximum(np.diff(m) * DT, DT)
+        breaks = np.flatnonzero(sp > V_BALL) + 1
+    # the same, judged by geometry rather than speed: a run of at most half a second that strays 3+ m
+    # from where the ball just was, after which the ball is back near that spot
+    for _ in range(3):
+        keep = np.ones(len(m), bool)
+        i = 1
+        n_ = len(m)
+        while i < n_ - 1:
+            p = xy[i - 1]
+            if np.linalg.norm(xy[i] - p) <= 3.0 or m[i] - m[i - 1] > MAX_GAP:
+                i += 1; continue
+            j = i
+            while j < n_ and np.linalg.norm(xy[j] - p) > 3.0 and m[j] - m[i] <= 8:
+                j += 1
+            if j < n_ and m[j] - m[i] <= 12 and np.linalg.norm(xy[j] - p) <= 1.5 + 6.0 * (m[j] - m[i - 1]) * DT:
+                keep[i:j] = False
+            i = max(j, i + 1)
+        if keep.all():
+            break
+        m, nodes, xy, h = m[keep], nodes[keep], xy[keep], h[keep]
+    sp = np.linalg.norm(np.diff(xy, axis=0), axis=1) / np.maximum(np.diff(m) * DT, DT)
+    breaks = np.flatnonzero(sp > V_BALL) + 1
+    print(f"after removing excursions: {len(m)} sightings, {len(breaks)} impossible jumps left")
     # light smoothing (median of three) removes single-frame flicker without rounding off kicks
     from scipy.ndimage import median_filter
     cuts = np.union1d(np.flatnonzero(np.diff(m) > MAX_GAP) + 1, breaks)
