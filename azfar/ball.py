@@ -23,13 +23,14 @@ V_BALL = 28.0        # m/s, hardest plausible shot
 MAX_GAP = 30         # frames the ball may be unseen inside one path piece (2 s)
 TOP = 8              # candidates kept per frame
 H_MAX = 3.0          # highest the ball is assumed to fly, m
+NODE_COST = 0.05     # small: faint but consistent sightings (ball in traffic, fast shots) must still win over skipping
 W_MOTION = 0.12      # weight of a motion blob relative to detector confidence
 
 
 def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     """All sightings of one camera as sight lines. Time index m = frames at 15 per second since midnight."""
     cams = aim_cameras(calib, ch)
-    M, PX, SZ, CF, COL, EL = [], [], [], [], [], []
+    M, PX, SZ, CF, COL, EL, PR = [], [], [], [], [], [], []
     PK, PB = [], []
     for c in clips:
         if c.ch != ch:
@@ -48,11 +49,15 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
             dc = np.load(ps)["det_col"] if ps and os.path.exists(ps) and "det_col" in np.load(ps).files else None
             COL.append(dc[sel] if dc is not None else np.full((sel.sum(), 3), np.nan, np.float32))
             EL.append(np.ones(sel.sum(), np.float32))
+            pp_ = os.path.join(os.path.dirname(scan_dir.rstrip("/")) or ".", "ballpatch", name.replace(".npz", "_pdet.npy")) if scan_dir else ""
+            PR.append(np.load(pp_) if pp_ and os.path.exists(pp_) else np.full(sel.sum(), np.nan, np.float32))
         p = os.path.join(scan_dir, name) if scan_dir else ""
         if p and os.path.exists(p):
             d = np.load(p)
             COL.append(d["col"] if "col" in d.files else np.full((len(d["f"]), 3), np.nan, np.float32))
             EL.append(d["elong"] if "elong" in d.files else np.ones(len(d["f"]), np.float32))
+            pp_ = os.path.join(os.path.dirname(scan_dir.rstrip("/")) or ".", "ballpatch", name.replace(".npz", "_pblob.npy"))
+            PR.append(np.load(pp_) if os.path.exists(pp_) else np.full(len(d["f"]), np.nan, np.float32))
             M.append(np.round(c.t0 * FPS).astype(np.int64) + d["f"].astype(np.int64)); PX.append(d["xy"].astype(np.float64))
             SZ.append(d["size"]); CF.append(-(d["bright"] / 255.0))      # negative marks a motion blob (brightness kept)
     det_boxes = None
@@ -60,9 +65,9 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
         pk, pb = np.concatenate(PK), np.concatenate(PB)
         o = np.argsort(pk, kind="stable")
         det_boxes = (pk[o], pb[o])
-    M, PX, SZ, CF, COL, EL = (np.concatenate(x) for x in (M, PX, SZ, CF, COL, EL))
+    M, PX, SZ, CF, COL, EL, PR = (np.concatenate(x) for x in (M, PX, SZ, CF, COL, EL, PR))
     keep = (M >= m_lo) & (M < m_hi)
-    M, PX, SZ, CF, COL, EL = M[keep], PX[keep], SZ[keep], CF[keep], COL[keep], EL[keep]
+    M, PX, SZ, CF, COL, EL, PR = M[keep], PX[keep], SZ[keep], CF[keep], COL[keep], EL[keep], PR[keep]
     mot = CF < 0
     n0 = mot.sum()
     drop = np.zeros(len(M), bool)
@@ -71,6 +76,10 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     known = ~np.isnan(sat) & (val > 0)
     streak = EL > 1.8          # a fast ball blurs into the grass: more colour, less brightness
     not_ball = known & ((sat > np.where(streak, 115, 88)) | ((yel > 0.22) & (sat > 65)) | (val < np.where(streak, 95, 110)))
+    scored = np.isfinite(PR)
+    # where the learnt recogniser has scored a candidate, it decides (it has seen this ball and these boots)
+    not_ball = np.where(scored, np.where(CF < 0, PR < 0.3, (PR < 0.1) & (CF < 0.5)), not_ball)
+    known = known | scored
     drop |= not_ball
     print(f"  {ch}: {not_ball[~mot].sum()} of {(~mot).sum()} detector hits and {not_ball[mot].sum()} of {mot.sum()} motion sightings rejected by colour")
     # 1) goal frames and nets: the net flutters and looks like a small moving object
@@ -107,13 +116,13 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
     # test and counts for less; without colour information it is not used at all
     print(f"  {ch}: {(near & ~drop).sum()} motion sightings next to players kept at reduced weight")
     drop |= near & ~known
-    CF = np.where(near, CF * 0.5, CF)
-    M, PX, SZ, CF = M[~drop], PX[~drop], SZ[~drop], CF[~drop]
+    CF = np.where(near & ~scored, CF * 0.5, CF)
+    M, PX, SZ, CF, PR = M[~drop], PX[~drop], SZ[~drop], CF[~drop], PR[~drop]
     # fixed false alarms: the same image cell firing again and again
     cell = (PX[:, 0] // 14).astype(int) * 1000 + (PX[:, 1] // 14).astype(int)
     u, inv, cnt = np.unique(cell, return_inverse=True, return_counts=True)
     keep = cnt[inv] < max(400, 0.012 * (m_hi - m_lo))
-    M, PX, SZ, CF = M[keep], PX[keep], SZ[keep], CF[keep]
+    M, PX, SZ, CF, PR = M[keep], PX[keep], SZ[keep], CF[keep], PR[keep]
     O = np.zeros((len(M), 3)); D = np.zeros((len(M), 3)); G = np.zeros((len(M), 2)); ok = np.zeros(len(M), bool)
     rng = np.zeros(len(M))
     t = M / FPS
@@ -165,6 +174,9 @@ def load(det_dir, scan_dir, clips, calib, ch, m_lo, m_hi):
                     hfix[i] = float(np.clip(1.75 * (b[j, 3] - y) / bh[j], 0.3, 2.3))
     print(f"  {ch}: {np.isfinite(hfix).sum()} detector sightings of the ball held or against a body")
     w = np.where(CF >= 0, CF, W_MOTION * (0.5 + 0.5 * -CF) * np.exp(-0.5 * np.log(np.maximum(ratio, 0.2) / 1.2) ** 2))
+    # recogniser score, where available: motion blobs it is sure of count almost like a detector hit
+    sizefit = np.exp(-0.5 * np.log(np.maximum(ratio, 0.2) / 1.2) ** 2)
+    w = np.where(np.isfinite(PR), np.where(CF >= 0, CF * (0.4 + 0.6 * np.nan_to_num(PR)), 0.35 * np.nan_to_num(PR) * sizefit), w)
     w = w * np.where(rng < 24, 1.0, 0.6)                    # trust a camera most in its own half
     return dict(m=M[good], w=w[good], det=(CF >= 0)[good], O=O[good], D=D[good], g=G[good], hfix=hfix[good])
 
@@ -251,7 +263,7 @@ def best_path(cand):
             if score[older] > run_best:
                 run_best, run_arg = score[older], older
             older += 1
-        own = 2.5 * nodes[a, 3] - 0.14           # reward confident sightings, charge a little for each point
+        own = 2.5 * nodes[a, 3] - NODE_COST      # reward confident sightings, charge a little for each point
         best, arg = (run_best - RESTART, run_arg) if run_arg >= 0 else (0.0, -1)
         lo, hi = lo_all[a], hi_all[a]
         if hi > lo:
