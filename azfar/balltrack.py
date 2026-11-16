@@ -22,7 +22,8 @@ from .fuse import aim_cameras
 from .timeline import scan, FPS, GRID_HZ
 
 STEP = int(round(FPS / GRID_HZ))
-MIN_CONF = 0.25
+MIN_CONF = 0.10          # weak sightings are only ever used to continue a locked track, inside its gate
+TRACK_CONF = 0.25
 START_CONF = 0.5
 CONFIRM_HITS = 3
 CONFIRM_WINDOW = 6
@@ -84,12 +85,12 @@ def track_camera(F, XY, SZ, CF):
             ppm_k = np.minimum(px_per_m(s), np.maximum(sz, 6.0) / BALL_D)      # the smaller of the two boxes
             reach = np.minimum(MAX_SPEED / FPS * ppm_k, KICK_MAX_PX) * dt + max(s, 10.0)
             same_size = (sz > 0.5 * s) & (sz < 2.0 * s)
-            ok = dp <= gate
+            ok = dp <= gate              # any sighting (even weak) where the locked ball is predicted
             j = None
             if ok.any():
                 j = int(np.argmin(np.where(ok, dp / np.maximum(cf, 0.1), np.inf)))
             else:
-                kick = (cf >= KICK_CONF) & (dk <= reach) & same_size
+                kick = (cf >= KICK_CONF) & (dk <= reach) & same_size   # direction changes need a confident sighting
                 if kick.any():
                     j = int(np.argmin(np.where(kick, dk, np.inf)))
             if j is not None:
