@@ -16,7 +16,8 @@ DT = 1.0 / GRID_HZ
 CONTROL_R = 1.6        # m: ball this close to a player's feet is "theirs"
 GOAL_W = 3.0           # goal width, m
 SHOT_V = 7.5           # m/s: slower than this towards goal is a pass/roll, not a shot
-BALL_GAP = 2           # ticks of missing ball bridged (0.4 s): if the ball is not found, it is not shown
+BALL_GAP = 2           # display: ticks of missing ball bridged (0.4 s). If the ball is not found, it is not shown.
+EVENT_GAP = 15         # statistics only: possession and passes are inferred across hidden gaps up to 3 s (never drawn)
 
 
 def grid_tracks(I, k0, k1, max_gap=15):
@@ -39,10 +40,10 @@ def grid_tracks(I, k0, k1, max_gap=15):
     return pids, P
 
 
-def grid_ball(B, k0, k1):
+def grid_ball(B, k0, k1, gap=BALL_GAP):
     b = np.full((k1 - k0, 2), np.nan)
     k, xy = B["k"], B["xy"]
-    cuts = np.flatnonzero(np.diff(k) > BALL_GAP) + 1
+    cuts = np.flatnonzero(np.diff(k) > gap) + 1
     for s, e in zip(np.r_[0, cuts], np.r_[cuts, len(k)]):
         if e - s < 2:
             continue
@@ -148,7 +149,7 @@ def infer_teams(P, kickoffs, pitch, session_start=0):
 def run(I, B, pitch, team_override=None):
     k0, k1 = int(I["k"].min()), int(I["k"].max()) + 1
     pids, P = grid_tracks(I, k0, k1)
-    ball = grid_ball(B, k0, k1)
+    ball = grid_ball(B, k0, k1, gap=EVENT_GAP)
     L, W = pitch["L"], pitch["W"]
     kickoffs = detect_kickoffs(P, ball, pitch)
     team, sign = infer_teams(P, kickoffs, pitch)
