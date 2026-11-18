@@ -1,7 +1,7 @@
 """Conservative ball tracking on the dedicated detector's every-frame output.
 
 Rules (per camera, in the image, 15 frames per second):
-  * show nothing unless sure: a track is only shown once it has CONFIRM_HITS sightings within
+  * show nothing unless sure: a track is only shown once it has three sightings within
     CONFIRM_WINDOW frames that move consistently
   * once sure, stay locked: while a track lives, every other ball-like detection is ignored. It continues
     with the sighting nearest to where its own motion predicts the ball (fast shots follow that prediction);
@@ -25,12 +25,10 @@ STEP = int(round(FPS / GRID_HZ))
 MIN_CONF = 0.10          # weak sightings are only ever used to continue a locked track, inside its gate
 TRACK_CONF = 0.25
 START_CONF = 0.5
-CONFIRM_HITS = 3
 CONFIRM_WINDOW = 6
 MAX_MISS = 8           # frames (0.53 s)
 FILL_GAP = 6           # frames (0.4 s)
 KICK_CONF = 0.6
-KICK_MAX_PX = 45.0     # px per frame a kicked ball may jump at most
 KICK_CONFIRM = 2       # sightings needed to confirm a change of direction
 MAX_SPEED = 30.0       # m/s
 BALL_D = 0.22
@@ -48,82 +46,117 @@ def static_cells(F, XY, cell=4, sec=60):
     return near
 
 
+def max_displacement(size1, size2, dt):
+    """Max projected travel over dt frames, using ball diameter as the local pixel scale."""
+    size = np.maximum(np.minimum(size1, size2), 3.0)
+    return size * (MAX_SPEED / (BALL_D * FPS) * dt) + np.maximum(size, 4.0)
+
+
+def acquire(F, XY, SZ, CF, first, start, stop):
+    """Find a three-hit constant-velocity seed ending in this frame, within CONFIRM_WINDOW."""
+    prior = np.flatnonzero(CF[first:start] >= TRACK_CONF) + first
+    current = np.flatnonzero(CF[start:stop] >= TRACK_CONF) + start
+    if (len(prior) < 2 or not len(current)
+            or not np.any(CF[first:stop] >= START_CONF)):
+        return None
+    # Only a pair from distinct frames defines a velocity. Keep competing pairs
+    # until a third sighting supports the projected motion.
+    a, b = np.triu_indices(len(prior), 1)
+    a, b = prior[a], prior[b]
+    dt = F[b] - F[a]
+    distance = np.linalg.norm(XY[b] - XY[a], axis=1)
+    ok = ((dt > 0) & (distance <= max_displacement(SZ[a], SZ[b], dt))
+          & (np.maximum(SZ[a], SZ[b]) <= 2 * np.minimum(SZ[a], SZ[b]) + 1))
+    a, b, dt = a[ok], b[ok], dt[ok]
+    if not len(a):
+        return None
+    velocity = (XY[b] - XY[a]) / dt[:, None]
+    elapsed = F[start] - F[b]
+    prediction = XY[b] + velocity * elapsed[:, None]
+    # Allow for centroid noise and modest perspective/acceleration changes.
+    gate = np.maximum(SZ[b], 4.0) + 0.25 * np.linalg.norm(velocity, axis=1) * elapsed
+    best, best_score = None, -np.inf
+    for c in current:
+        error = np.linalg.norm(XY[c] - prediction, axis=1)
+        travel = np.linalg.norm(XY[c] - XY[b], axis=1)
+        ok = ((np.maximum(np.maximum(CF[a], CF[b]), CF[c]) >= START_CONF)
+              & (error <= gate) & (travel <= max_displacement(SZ[b], SZ[c], elapsed))
+              & (np.maximum(SZ[b], SZ[c]) <= 2 * np.minimum(SZ[b], SZ[c]) + 1))
+        if ok.any():
+            score = (CF[a] + CF[b] + CF[c]) / 3 - error / gate
+            i = np.argmax(np.where(ok, score, -np.inf))
+            if score[i] > best_score:
+                best_score = score[i]
+                best = [a[i], b[i], c]
+    return best
+
+
+def finish_track(track, tracks):
+    # A provisional kick at timeout or EOF never becomes a published sighting.
+    if track.get("probation", 0):
+        for key in ("f", "xy", "sz", "cf"):
+            del track[key][track["prob_start"]:]
+    tracks.append(track)
+
+
 def track_camera(F, XY, SZ, CF):
     """F: global frame index (15/s). Returns list of tracks: arrays (frame, x, y, size, conf, filled)."""
+    if len(F) == 0:
+        return []
     o = np.argsort(F, kind="stable")
-    F, XY, SZ, CF = F[o], XY[o], SZ[o], CF[o]
-    frames = np.unique(F)
-    bnd = np.searchsorted(F, np.r_[frames, frames[-1] + 1])
-    det = {int(f): (XY[bnd[i]:bnd[i + 1]], SZ[bnd[i]:bnd[i + 1]], CF[bnd[i]:bnd[i + 1]]) for i, f in enumerate(frames)}
+    F, XY, SZ, CF = F[o].astype(np.int64), XY[o].astype(float), SZ[o], CF[o]
+    frames, starts = np.unique(F, return_index=True)
     tracks, cur = [], None
-    allf = range(int(frames[0]), int(frames[-1]) + 1)
-
-    def px_per_m(size):
-        return max(size, 6.0) / BALL_D
-
-    for f in allf:
-        d = det.get(f)
+    earliest = frames[0]
+    for f, start, stop in zip(frames, starts, np.r_[starts[1:], len(F)]):
         if cur is not None:
             dt = f - cur["f"][-1]
-            if cur.get("probation", 0) > 0 and dt > 3:      # a direction change nobody confirmed: drop it, end here
-                k_ = cur["prob_start"]
-                for key in ("f", "xy", "sz", "cf"):
-                    cur[key] = cur[key][:k_]
-                cur["probation"] = 0
-                tracks.append(cur); cur = None
-            elif dt > MAX_MISS:
-                tracks.append(cur); cur = None
-        if cur is not None and d is not None:
-            p, v, s = cur["p"], cur["v"], cur["s"]
-            dt = f - cur["f"][-1]
-            pred = p + v * dt
-            ppm = px_per_m(s)
-            gate = max(1.2 * s, 10.0) + 0.35 * np.linalg.norm(v) * dt + 0.4 * ppm * (dt - 1)
-            xy, sz, cf = d
-            dp = np.linalg.norm(xy - pred, axis=1)
-            dk = np.linalg.norm(xy - p, axis=1)
-            ppm_k = np.minimum(px_per_m(s), np.maximum(sz, 6.0) / BALL_D)      # the smaller of the two boxes
-            reach = np.minimum(MAX_SPEED / FPS * ppm_k, KICK_MAX_PX) * dt + max(s, 10.0)
-            same_size = (sz > 0.5 * s) & (sz < 2.0 * s)
-            ok = dp <= gate              # any sighting (even weak) where the locked ball is predicted
-            j = None
-            if ok.any():
-                j = int(np.argmin(np.where(ok, dp / np.maximum(cf, 0.1), np.inf)))
-            else:
-                kick = (cf >= KICK_CONF) & (dk <= reach) & same_size   # direction changes need a confident sighting
-                if kick.any():
-                    j = int(np.argmin(np.where(kick, dk, np.inf)))
-            if j is not None:
-                if not ok.any():
-                    cur["probation"] = KICK_CONFIRM; cur["prob_start"] = len(cur["f"])
-                elif cur.get("probation", 0) > 0:
-                    cur["probation"] -= 1
-                vn = (xy[j] - p) / dt
-                cur["v"] = vn if len(cur["f"]) < 2 else 0.6 * vn + 0.4 * v
-                cur["p"], cur["s"] = xy[j].astype(float), 0.7 * s + 0.3 * float(sz[j])
-                cur["f"].append(f); cur["xy"].append(xy[j].copy()); cur["sz"].append(float(sz[j])); cur["cf"].append(float(cf[j]))
+            if dt > MAX_MISS or (cur.get("probation", 0) and dt > 3):
+                finish_track(cur, tracks)
+                earliest = cur["f"][-1] + 1
+                cur = None
+        if cur is None:
+            first = np.searchsorted(F, max(earliest, f - CONFIRM_WINDOW))
+            hits = acquire(F, XY, SZ, CF, first, start, stop)
+            if hits is not None:
+                a, _, c = hits
+                cur = dict(v=(XY[c] - XY[a]) / (F[c] - F[a]), s=float(SZ[c]),
+                           f=list(F[hits]), xy=list(XY[hits]), sz=list(SZ[hits]), cf=list(CF[hits]))
+            continue
+        xy, sz, cf = XY[start:stop], SZ[start:stop], CF[start:stop]
+        p, v, s = cur["xy"][-1], cur["v"], cur["s"]
+        dt = f - cur["f"][-1]
+        dp = np.linalg.norm(xy - (p + v * dt), axis=1)
+        dk = np.linalg.norm(xy - p, axis=1)
+        gate = max(1.2 * s, 10.0) + 0.35 * np.linalg.norm(v) * dt + 0.4 * max(s, 3) / BALL_D * (dt - 1)
+        reachable = dk <= max_displacement(s, sz, dt)
+        follows = (cf >= MIN_CONF) & (dp <= gate) & reachable
+        if follows.any():
+            j = int(np.argmin(np.where(follows, dp / np.maximum(cf, 0.1), np.inf)))
+            vn = (xy[j] - p) / dt
+            cur["v"] = 0.6 * vn + 0.4 * v
+            if cur.get("probation", 0):
+                cur["probation"] -= 1
+        else:
+            same_size = np.maximum(sz, s) <= 2 * np.minimum(sz, s) + 1
+            kick = (cf >= KICK_CONF) & reachable & same_size
+            if cur.get("probation", 0) or not kick.any():
                 continue
-        if cur is None and d is not None:
-            xy, sz, cf = d
-            j = int(np.argmax(cf))
-            if cf[j] >= START_CONF:
-                cur = dict(p=xy[j].astype(float), v=np.zeros(2), s=float(sz[j]), f=[f], xy=[xy[j].copy()], sz=[float(sz[j])], cf=[float(cf[j])])
+            j = int(np.argmin(np.where(kick, dk, np.inf)))
+            cur["probation"] = KICK_CONFIRM
+            cur["prob_start"] = len(cur["f"])
+            cur["v"] = (xy[j] - p) / dt
+        cur["s"] = 0.7 * s + 0.3 * float(sz[j])
+        cur["f"].append(f)
+        cur["xy"].append(xy[j])
+        cur["sz"].append(float(sz[j]))
+        cur["cf"].append(float(cf[j]))
     if cur is not None:
-        tracks.append(cur)
+        finish_track(cur, tracks)
     out = []
     for t in tracks:
-        if not t["f"]:
-            continue
-        f = np.array(t["f"])
-        # confirmed: CONFIRM_HITS sightings within CONFIRM_WINDOW frames somewhere at the start of the track
-        ok_start = None
-        cfa = np.array(t["cf"])
-        for i in range(len(f) - CONFIRM_HITS + 1):
-            if f[i + CONFIRM_HITS - 1] - f[i] <= CONFIRM_WINDOW and cfa[i:i + CONFIRM_HITS].mean() >= 0.45:
-                ok_start = i; break
-        if ok_start is None:
-            continue
-        f = f[ok_start:]; xy = np.array(t["xy"])[ok_start:]; sz = np.array(t["sz"])[ok_start:]; cf = np.array(t["cf"])[ok_start:]
+        f, xy = np.array(t["f"]), np.array(t["xy"])
+        sz, cf = np.array(t["sz"]), np.array(t["cf"])
         # parked spare ball: a track that never moves for 8+ s is not the ball in play (the centre spot is
         # handled by the caller)
         if f[-1] - f[0] >= 8 * FPS and np.percentile(np.linalg.norm(xy - np.median(xy, 0), axis=1), 95) < max(np.median(sz), 6):
@@ -149,11 +182,15 @@ def main():
     ap.add_argument("--session", default="config/session.json")
     ap.add_argument("--out", default="data/ball.npz")
     a = ap.parse_args()
-    calib = json.load(open(a.calib)); pitch = calib["pitch"]
-    m = json.load(open(a.session))["matches"][0]
+    with open(a.calib) as file:
+        calib = json.load(file)
+    pitch = calib["pitch"]
+    with open(a.session) as file:
+        m = json.load(file)["matches"][0]
     m_lo, m_hi = int(HMS(m["start"]) * FPS), int(HMS(m["end"]) * FPS)
     clips = scan(a.raw)
     per_cam = {}
+    found_cache = False
     for ch in sorted(calib["cameras"]):
         cams = aim_cameras(calib, ch)
         F, XY, SZ, CF = [], [], [], []
@@ -163,10 +200,20 @@ def main():
             p = os.path.join(a.dets, os.path.basename(c.path)[:-4] + ".npz")
             if not os.path.exists(p):
                 continue
-            d = np.load(p)
-            b = d["box"]
-            F.append(np.round(c.t0 * FPS).astype(np.int64) + d["f"].astype(np.int64))
-            XY.append(np.c_[(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2]); SZ.append(np.maximum(b[:, 2] - b[:, 0], b[:, 3] - b[:, 1])); CF.append(d["conf"])
+            found_cache = True
+            with np.load(p) as d:
+                CF.append(d["conf"])
+                b = d["box"]
+                F.append(np.round(c.t0 * FPS).astype(np.int64) + d["f"].astype(np.int64))
+                XY.append((b[:, :2] + b[:, 2:]) / 2)
+            sides = b[:, 2:] - b[:, :2]
+            short, long = sides.min(axis=1), sides.max(axis=1)
+            # The width across a motion streak estimates ball diameter. Its length
+            # measures blur and would make a fast ground ball look airborne.
+            SZ.append(np.where(long > 1.8 * short, short, long))
+        if not F:
+            per_cam[ch] = {}
+            continue
         F, XY, SZ, CF = (np.concatenate(x) for x in (F, XY, SZ, CF))
         k = (F >= m_lo) & (F < m_hi) & (CF >= MIN_CONF)
         F, XY, SZ, CF = F[k], XY[k], SZ[k], CF[k]
@@ -208,6 +255,8 @@ def main():
                     frame_pt[int(r["f"][fi])] = (Cg, d[i], g[i], bool(ok[i]), r_obs[i], r["start"], bool(r["fl"][fi]))
         per_cam[ch] = frame_pt
     # put on the pitch
+    if not found_cache:
+        raise FileNotFoundError(f"No ball detection files in {a.dets} matched the clips in {a.raw}")
     chs = sorted(per_cam)
     allf = sorted(set(per_cam[chs[0]]) | set(per_cam[chs[1]]))
     L, W = pitch["L"], pitch["W"]
@@ -224,25 +273,26 @@ def main():
                 if s_ > 0 and t_ > 0 and np.linalg.norm(pa - pb) < 0.8 and -0.3 < -(pa[2] + pb[2]) / 2 < 5:
                     P = (pa + pb) / 2; pt = (P[0], P[1], max(-P[2], 0.11)); src = "both"
         if pt is None:
-            cand = [(c_, v) for c_, v in ((chs[0], A), (chs[1], B)) if v and v[3]]
+            cand = []
+            for ch, view in ((chs[0], A), (chs[1], B)):
+                if view is None:
+                    continue
+                origin, _, g, ok, r_obs, start, _ = view
+                if not ok or not (-1.5 < g[0] < L + 1.5 and -1.5 < g[1] < W + 1.5):
+                    continue
+                # A ball much larger than expected at its ground point may be airborne.
+                ground_range = np.linalg.norm(np.r_[g, -0.11] - origin)
+                if r_obs >= 0.6 * ground_range:
+                    cand.append((ch, start, g))
             if not cand:
                 continue
-            if len(cand) == 2:   # disagreement: keep the current source, else the one locked on longer
-                cand.sort(key=lambda cv: (cv[0] != src_last, cv[1][5]))
-            c_, v = cand[0]
-            Cg, d, g, ok, r_obs, _, _ = v
-            r_gnd = np.linalg.norm(np.r_[g, 0.0] - Cg)
-            if r_obs < 0.6 * r_gnd:
-                # it looks much bigger than a ball on the ground there would: it is in the air, and one camera
-                # cannot say where. Not sure -> not shown.
-                continue
+            src, _, g = min(cand, key=lambda v: (v[0] != src_last, v[1]))
             pt = (g[0], g[1], 0.11)
-            src = c_
         if not (-1.5 < pt[0] < L + 1.5 and -1.5 < pt[1] < W + 1.5):
             continue
         src_last = src
         out_f.append(f); out_xy.append(pt[:2]); out_z.append(pt[2]); out_src.append(src)
-    out_f, out_xy, out_z = np.array(out_f), np.array(out_xy), np.array(out_z)
+    out_f, out_xy, out_z = np.array(out_f, dtype=np.int64), np.array(out_xy).reshape(-1, 2), np.array(out_z)
     # 5 per second for the stats and the replay: the frame on the tick, else one either side; no other filling
     ks, kxy, kz = [], [], []
     pos = {int(f): i for i, f in enumerate(out_f)}
@@ -253,9 +303,9 @@ def main():
         a_, b_ = pos.get(k * STEP - 1), pos.get(k * STEP + 1)     # exact moment: midway between the frames either side
         if a_ is not None and b_ is not None:
             ks.append(k); kxy.append((out_xy[a_] + out_xy[b_]) / 2); kz.append((out_z[a_] + out_z[b_]) / 2)
-    ks, kxy, kz = np.array(ks), np.array(kxy), np.array(kz)
+    ks, kxy, kz = np.array(ks, dtype=np.int64), np.array(kxy).reshape(-1, 2), np.array(kz)
     np.savez_compressed(a.out, k=ks, xy=kxy, z=kz, m15=out_f, xy15=out_xy, z15=out_z,
-                        views15=np.array([{'both': 2}.get(x, 1) for x in out_src]), src15=np.array(out_src), w15=np.ones(len(out_f)))
+                        views15=np.array([{'both': 2}.get(x, 1) for x in out_src], dtype=int), src15=np.array(out_src, dtype=str), w15=np.ones(len(out_f)))
     span = (m_hi - m_lo) / STEP
     st = np.diff(kxy, axis=0)[np.diff(ks) == 1]
     print(f"ball shown on {len(ks) / span * 100:.0f}% of the match; jumps > 4 m in 0.2 s: {int((np.linalg.norm(st, axis=1) > 4).sum())}")

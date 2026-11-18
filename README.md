@@ -27,6 +27,20 @@ Put the XVR files (`XVR_ch<N>_main_<start>_<end>.mp4`) in `data/raw/`, then:
 `python -m azfar.sheet` writes a contact sheet (a row of crops per player) for checking identities
 and putting names to numbers. Names, team overrides and match windows go in `config/session.json`.
 
+## Fast balls at 15 fps
+
+The ball detector checks each decoded frame for motion blur as well as running YOLO. A moving
+streak supplies a weak sighting whose width estimates the ball diameter. The tracker uses the
+elapsed frame count to compare possible trajectories, so a shot can move several ball diameters
+between sightings. It requires a detector anchor and consistent motion before showing the track.
+
+For recordings that already have detection files, regenerate the candidates and then the track:
+
+```sh
+python -m azfar.balldet --refresh
+python -m azfar.balltrack
+```
+
 ## Experiments kept for reference
 
 `azfar.possession` (who has the ball, straight passes between players) and `azfar.ballfuse` (combine it with the
